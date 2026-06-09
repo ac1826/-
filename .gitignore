@@ -4,7 +4,6 @@
 # Keep only source code and lightweight project files in Git.
 !.gitignore
 !requirement.txt
-!app.py
 !app_鲜冻品占比.py
 !tests/
 !tests/*.py
