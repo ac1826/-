@@ -20,8 +20,8 @@ function Write-Log {
 }
 
 function Invoke-Git {
-    param([string[]]$Args)
-    $output = & git @Args 2>&1
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$GitArgs)
+    $output = & git @GitArgs 2>&1
     $code = $LASTEXITCODE
     if ($output) {
         Write-Log ($output -join "`n")
