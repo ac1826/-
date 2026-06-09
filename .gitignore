@@ -10,3 +10,4 @@
 !tests/*.py
 !scripts/
 !scripts/*.py
+!scripts/*.ps1
