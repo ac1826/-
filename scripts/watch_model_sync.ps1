@@ -48,7 +48,7 @@ while ($true) {
         $lastWrite = $currentWrite
         Start-Sleep -Seconds $DebounceSeconds
 
-        $diffCode = Invoke-Git @('-C', $RepoDir, 'diff', '--quiet', '--', $ModelFileName)
+        $diffCode = Invoke-Git -GitArgs @('-C', $RepoDir, 'diff', '--quiet', '--', $ModelFileName)
         if ($diffCode -eq 0) {
             Write-Log 'Detected save, but no model diff to sync.'
             continue
@@ -57,25 +57,25 @@ while ($true) {
         $message = 'Auto-sync model change ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
         Write-Log "Committing model change: $message"
 
-        $addCode = Invoke-Git @('-C', $RepoDir, 'add', '--', $ModelFileName)
+        $addCode = Invoke-Git -GitArgs @('-C', $RepoDir, 'add', '--', $ModelFileName)
         if ($addCode -ne 0) {
             Write-Log "git add failed with code $addCode"
             continue
         }
 
-        $commitCode = Invoke-Git @('-C', $RepoDir, 'commit', '-m', $message, '--', $ModelFileName)
+        $commitCode = Invoke-Git -GitArgs @('-C', $RepoDir, 'commit', '-m', $message, '--', $ModelFileName)
         if ($commitCode -ne 0) {
             Write-Log "git commit skipped/failed with code $commitCode"
             continue
         }
 
-        $pullCode = Invoke-Git @('-C', $RepoDir, 'pull', '--rebase', 'origin', $Branch)
+        $pullCode = Invoke-Git -GitArgs @('-C', $RepoDir, 'pull', '--rebase', 'origin', $Branch)
         if ($pullCode -ne 0) {
             Write-Log "git pull --rebase failed with code $pullCode; push skipped."
             continue
         }
 
-        $pushCode = Invoke-Git @('-C', $RepoDir, 'push', 'origin', $Branch)
+        $pushCode = Invoke-Git -GitArgs @('-C', $RepoDir, 'push', 'origin', $Branch)
         if ($pushCode -ne 0) {
             Write-Log "git push failed with code $pushCode"
             continue
