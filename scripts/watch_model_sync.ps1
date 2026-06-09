@@ -6,7 +6,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$ModelFileName = 'app_鲜冻品占比.py'
+$ModelFileName = 'app_' + [string][char]0x9c9c + [string][char]0x51bb + [string][char]0x54c1 + [string][char]0x5360 + [string][char]0x6bd4 + '.py'
 $ModelPath = Join-Path $RepoDir $ModelFileName
 $LogDir = Join-Path $RepoDir 'monitor_logs'
 $LogFile = Join-Path $LogDir 'model_auto_sync.log'
