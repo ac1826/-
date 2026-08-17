@@ -16,7 +16,27 @@ from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.cell.cell import MergedCell
 from openpyxl.worksheet.worksheet import Worksheet
-from openpyxl.styles import PatternFill, Alignment, Font
+from openpyxl.styles import PatternFill, Alignment, Font, Border, Side, Color
+
+_thin_border = Border(
+    left=Side(style="thin"),
+    right=Side(style="thin"),
+    top=Side(style="thin"),
+    bottom=Side(style="thin"),
+)
+
+
+def _apply_borders(ws, min_row=1, max_row=None, min_col=1, max_col=None):
+    """Apply thin borders to a range of cells, skipping MergedCell."""
+    if max_row is None:
+        max_row = ws.max_row
+    if max_col is None:
+        max_col = ws.max_column
+    for r in range(min_row, max_row + 1):
+        for c in range(min_col, max_col + 1):
+            cell = ws.cell(r, c)
+            if not isinstance(cell, MergedCell):
+                cell.border = _thin_border
 
 
 SKIP_STREAMLIT_UI = os.environ.get("FRESH_FROZEN_SKIP_UI") == "1"
@@ -115,15 +135,33 @@ def normalize_plant_code(plant_name: str) -> str:
 
 
 MARKET_PRICE_TEMPLATE_SHEET = "行情价覆盖"
-MARKET_PRICE_TEMPLATE_COLUMNS = ["工厂", "分类", "当前行情价", "基期行情价", "备注"]
+MARKET_PRICE_TEMPLATE_COLUMNS = ["工厂", "分类", "适用范围", "基期行情价", "当前行情价"]
 
 
 def _market_price_template_df():
     plants = sorted(set(PLANT_CODE_MAP.values()))
     rows = []
     for plant in plants:
-        for kind in ("腿肉", "胸肉", "其他"):
-            rows.append({"工厂": plant, "分类": kind, "当前行情价": None, "基期行情价": None, "备注": ""})
+        for kind in ("腿肉", "胸肉"):
+            for scope in ("普通", "特殊"):
+                rows.append(
+                    {
+                        "工厂": plant,
+                        "分类": kind,
+                        "适用范围": scope,
+                        "基期行情价": None,
+                        "当前行情价": None,
+                    }
+                )
+        rows.append(
+            {
+                "工厂": plant,
+                "分类": "其他",
+                "适用范围": "普通",
+                "基期行情价": None,
+                "当前行情价": None,
+            }
+        )
     return pd.DataFrame(rows, columns=MARKET_PRICE_TEMPLATE_COLUMNS)
 
 
@@ -133,7 +171,7 @@ def _build_market_price_template_bytes():
         df = _market_price_template_df()
         df.to_excel(writer, index=False, sheet_name=MARKET_PRICE_TEMPLATE_SHEET)
         ws = writer.book[MARKET_PRICE_TEMPLATE_SHEET]
-        widths = {"A": 10, "B": 10, "C": 18, "D": 18, "E": 24}
+        widths = {"A": 10, "B": 10, "C": 12, "D": 18, "E": 18}
         for col, width in widths.items():
             ws.column_dimensions[col].width = width
     out.seek(0)
@@ -267,6 +305,8 @@ def read_tsc_df(xls: pd.ExcelFile, kind: str):
 
 
 def read_part_df(xls: pd.ExcelFile, kind: str):
+    if str(kind).strip() == "特殊":
+        return read_sheet_safe(xls, "特殊", score_fn=_score_part_columns) if "特殊" in xls.sheet_names else None
     for sn in xls.sheet_names:
         if sn.endswith(kind) and not sn.endswith("TSC"):
             return read_sheet_safe(xls, sn, score_fn=_score_part_columns)
@@ -632,8 +672,10 @@ def select_actual_rows(md: dict, qd: dict, quarter_label: str):
     return current, previous
 
 
-def _resolve_effective_q_qty(qrow: dict | None, impact_row: dict | None):
+def _resolve_effective_q_qty(qrow: dict | None, impact_row: dict | None, kind: str | None = None):
     q_qty = to_num((qrow or {}).get("半成品入库量"))
+    if str(kind or "").strip() == "特殊":
+        return q_qty or 0.0
     if q_qty in (None, 0):
         q_qty = to_num((impact_row or {}).get("半成品入库量"))
     return q_qty or 0.0
@@ -951,6 +993,12 @@ def build_kind(records, month_label, quarter_label, kind, material_spec_profile=
         code_to_spec = rec["code_to_spec"]
         month_parts = rec["month_part_rows"]
         q_parts = rec["q_part_rows"]
+        month_fs_parts = rec.get("month_part_rows_raw") if kind == "腿肉" else None
+        q_fs_parts = rec.get("q_part_rows_raw") if kind == "腿肉" else None
+        if month_fs_parts is None:
+            month_fs_parts = month_parts
+        if q_fs_parts is None:
+            q_fs_parts = q_parts
 
         m_grp = defaultdict(lambda: defaultdict(list))
         q_grp = defaultdict(lambda: defaultdict(list))
@@ -999,7 +1047,7 @@ def build_kind(records, month_label, quarter_label, kind, material_spec_profile=
             mrow, qrow, diff = select_material_rows(md, qd, rec_q_label)
 
             m_qty = to_num((mrow or {}).get("半成品入库量")) or 0.0
-            q_qty = _resolve_effective_q_qty(qrow, impact)
+            q_qty = _resolve_effective_q_qty(qrow, impact, kind)
             if m_qty <= 0:
                 continue
 
@@ -1015,10 +1063,15 @@ def build_kind(records, month_label, quarter_label, kind, material_spec_profile=
             agg[f"{month_label}月产量"] += m_qty
             agg[f"{quarter_label}月均产量"] += q_qty
 
-        for p in month_parts:
+        for p in month_fs_parts:
             t, q = p["鲜冻"], p["数量"]
             if t in ("冻品", "鲜品"):
                 m_fs[plant][t] += q
+
+        for p in month_parts:
+            if kind == "腿肉" and _is_80g_part(p, code_to_spec, material_spec_profile):
+                continue
+            q = p["数量"]
             raw_code = norm_code(p.get("原料号"))
             spec_text = code_to_spec.get(raw_code, "")
             raw_desc = str(p.get("原料描述") or "")
@@ -1027,10 +1080,15 @@ def build_kind(records, month_label, quarter_label, kind, material_spec_profile=
                 spec_set.add(spec)
                 m_spec[plant][spec] += q
 
-        for p in q_parts:
+        for p in q_fs_parts:
             t, q = p["鲜冻"], p["数量"]
             if t in ("冻品", "鲜品"):
                 q_fs[plant][t] += q
+
+        for p in q_parts:
+            if kind == "腿肉" and _is_80g_part(p, code_to_spec, material_spec_profile):
+                continue
+            q = p["数量"]
             raw_code = norm_code(p.get("原料号"))
             spec_text = code_to_spec.get(raw_code, "")
             raw_desc = str(p.get("原料描述") or "")
@@ -1129,18 +1187,25 @@ def build_kind(records, month_label, quarter_label, kind, material_spec_profile=
         qf = sum(q_fs[p]["冻品"] for p in plants)
         qx = sum(q_fs[p]["鲜品"] for p in plants)
         mt, qt = mf + mx, qf + qx
+        month_frozen_ratio = mf / mt if mt else None
+        month_fresh_ratio = mx / mt if mt else None
+        q_frozen_ratio = qf / qt if qt else None
+        q_fresh_ratio = qx / qt if qt else None
+        q_total_ratio = 1 if qt else None
         s2_rows += [
-            {"工厂": "合计", "月份": f"{month_label}月", "冻品": mf / mt if mt else None, "鲜品": mx / mt if mt else None, "合计": 1 if mt else None},
-            {"工厂": "", "月份": quarter_label, "冻品": qf / qt if qt else None, "鲜品": qx / qt if qt else None, "合计": 1 if qt else None},
-            {"工厂": "", "月份": "差异", "冻品": (mf / mt if mt else 0) - (qf / qt if qt else 0), "鲜品": (mx / mt if mt else 0) - (qx / qt if qt else 0), "合计": 0},
+            {"工厂": "合计", "月份": f"{month_label}月", "冻品": month_frozen_ratio, "鲜品": month_fresh_ratio, "合计": 1 if mt else None},
+            {"工厂": "", "月份": quarter_label, "冻品": q_frozen_ratio, "鲜品": q_fresh_ratio, "合计": q_total_ratio},
+            {"工厂": "", "月份": "差异", "冻品": (month_frozen_ratio or 0) - (q_frozen_ratio or 0), "鲜品": (month_fresh_ratio or 0) - (q_fresh_ratio or 0), "合计": _diff_ratio(1 if mt else None, q_total_ratio)},
         ]
     s2 = pd.DataFrame(s2_rows)
 
     spec_headers = _spec_headers_for_export(kind, material_spec_profile)
-    extra_specs = sorted(sp for sp in spec_set if sp not in spec_headers)
+    if kind == "腿肉":
+        spec_headers = [h for h in spec_headers if h != "80g"]
+    extra_specs = sorted(sp for sp in spec_set if sp not in spec_headers and sp != "80g")
     specs = list(spec_headers) + extra_specs
     spec_plant_slots = _plant_slots_for_kind(kind)
-    spec_data_plants = sorted(set(list(m_spec.keys()) + list(q_spec.keys())))
+    spec_data_plants = sorted(p for p in set(list(m_spec.keys()) + list(q_spec.keys())) if p != "合计")
     spec_plants = (spec_plant_slots + [p for p in spec_data_plants if p not in spec_plant_slots]) if spec_data_plants else []
     s3_rows = []
     for p in spec_plants + (["合计"] if spec_plants else []):
@@ -1238,7 +1303,7 @@ def build_audit_detail(records, month_label, quarter_label, kind):
             base_row = mrow or qrow or impact or {}
 
             m_qty = to_num((mrow or {}).get("半成品入库量")) or 0.0
-            q_qty = _resolve_effective_q_qty(qrow, impact)
+            q_qty = _resolve_effective_q_qty(qrow, impact, kind)
             impact_scope = str((impact or {}).get("影响口径", "")).strip()
             included = impact is not None and impact_scope == "总成本" and m_qty > 0
 
@@ -1283,6 +1348,114 @@ def build_audit_detail(records, month_label, quarter_label, kind):
     out = out.reindex(columns=cols)
     out = out.sort_values(by=["工厂", "是否纳入综合影响", "修行后原料"], ascending=[True, False, True], kind="stable")
     return out
+
+
+def _is_complete_special_record(rec, quarter_label):
+    rec_q_label = rec.get("q_label") or quarter_label
+    market_map = rec.get("market_impact_map") or {}
+    month_part_mats = {
+        norm_code(part.get("修行后原料"))
+        for part in rec.get("month_part_rows") or []
+        if norm_code(part.get("修行后原料"))
+    }
+    grouped = defaultdict(lambda: defaultdict(list))
+    for row in rec.get("month_tsc_rows") or []:
+        mat = norm_code(row.get("修行后原料"))
+        if mat:
+            grouped[mat][row.get("行类型", "")].append(row)
+
+    if not grouped or not month_part_mats or not market_map:
+        return False
+
+    required_metrics = (
+        "修形前原料综合耗用单价",
+        "修形利用率",
+        "损耗率",
+        "半成品修形人工成本",
+        "半成品总成本",
+    )
+    has_positive_month_qty = False
+    for mat, rows_by_type in grouped.items():
+        current_actual, _ = select_actual_rows(rows_by_type, {}, rec_q_label)
+        month_row, _, _ = select_material_rows(rows_by_type, {}, rec_q_label)
+        month_qty = to_num((current_actual or month_row or {}).get("半成品入库量")) or 0.0
+        if month_qty <= 0:
+            continue
+
+        has_positive_month_qty = True
+        if mat not in month_part_mats:
+            return False
+
+        total_impact = match_impact_row(rows_by_type, prefer_scope="总成本")
+        if total_impact is None or any(to_num(total_impact.get(key)) is None for key in required_metrics):
+            return False
+
+        market_payload = market_map.get(mat)
+        if market_payload is None or (
+            to_num(market_payload.get("market_total_impact")) is None
+            and to_num(market_payload.get("market_unit_impact")) is None
+        ):
+            return False
+
+    return has_positive_month_qty
+
+
+def build_special_product_family_summary(audit_df: pd.DataFrame, month_label: str, quarter_label: str):
+    month_qty_col = f"{month_label}月产量"
+    q_qty_col = f"{quarter_label}月均产量"
+    market_source_col = "行情差异" if "行情差异" in audit_df.columns else "行情影响"
+    value_cols = [
+        "原料采购单价影响",
+        market_source_col,
+        "扣除行情后采购绩效",
+        "修形利用率影响",
+        "损耗率影响",
+        "修形人工成本影响",
+        "综合影响",
+        month_qty_col,
+        q_qty_col,
+    ]
+    output_cols = ["产品族", *value_cols]
+
+    detail = audit_df.copy()
+    if not detail.empty:
+        detail = detail[detail["是否纳入综合影响"].astype(str).str.strip() == "是"].copy()
+    if not detail.empty:
+        detail["产品族"] = detail.apply(
+            lambda row: str(row.get("产品族") or "").strip() or str(row.get("修行后原料") or "").strip(),
+            axis=1,
+        )
+        for col in value_cols:
+            if col not in detail.columns:
+                detail[col] = 0.0
+            else:
+                detail[col] = pd.to_numeric(detail[col], errors="coerce").fillna(0.0)
+        summary = detail.groupby("产品族", as_index=False, sort=False, dropna=False)[value_cols].sum()
+    else:
+        summary = pd.DataFrame(columns=output_cols)
+
+    if market_source_col != "行情差异":
+        summary = summary.rename(columns={market_source_col: "行情差异"})
+        value_cols = ["行情差异" if col == market_source_col else col for col in value_cols]
+    summary = summary.reindex(columns=["产品族", *value_cols])
+
+    total = {"产品族": "合计"}
+    for col in value_cols:
+        total[col] = float(pd.to_numeric(summary[col], errors="coerce").fillna(0.0).sum()) if col in summary else 0.0
+    summary = pd.concat([summary, pd.DataFrame([total])], ignore_index=True)
+
+    denominator = total.get("综合影响") or 0.0
+    impact = {"产品族": "影响"}
+    impact["原料采购单价影响"] = None
+    impact["行情差异"] = None
+    for col in ("扣除行情后采购绩效", "修形利用率影响", "损耗率影响", "修形人工成本影响", "综合影响"):
+        impact[col] = (total.get(col, 0.0) / denominator) if denominator else 0.0
+    impact[month_qty_col] = None
+    impact[q_qty_col] = None
+    impact_row_idx = len(summary)
+    for col in ["产品族", *value_cols]:
+        summary.loc[impact_row_idx, col] = impact.get(col)
+    return summary.reindex(columns=["产品族", *value_cols])
 
 
 def _as_workbook_source(source):
@@ -1766,7 +1939,7 @@ def _extract_total_impact_rows_uncached(source, kind: str):
         }
         for key, col in metric_cols.items():
             row[key] = to_num(ws.cell(row_idx, col).value) if col else None
-        if current_row and previous_row:
+        if kind != "特殊" and current_row and previous_row:
             row = _fill_missing_total_metrics(
                 row,
                 kind,
@@ -1820,7 +1993,7 @@ def _has_month_actual_rows(rows):
 
 def _pick_market_sheet_name(sheet_names, kind: str):
     kind_label = str(kind).strip()
-    if kind_label in ("腿肉", "胸肉"):
+    if kind_label in ("腿肉", "胸肉", "特殊"):
         exact_name = f"{kind_label}行情-较季度"
         return exact_name if exact_name in sheet_names else None
 
@@ -1839,7 +2012,7 @@ def _extract_market_impact_map(source, kind: str):
 
 def _extract_kind_market_impact_map(kind: str, month_source, quarter_source):
     kind_label = str(kind).strip()
-    source = month_source if kind_label in ("腿肉", "胸肉") else quarter_source
+    source = month_source if kind_label in ("腿肉", "胸肉", "特殊") else quarter_source
     return _extract_market_impact_map(source, kind_label)
 
 
@@ -1851,7 +2024,7 @@ def _extract_market_impact_map_uncached(source, kind: str):
             "product_family": payload.get("\u4ea7\u54c1\u65cf", ""),
             "spec_name": payload.get("\u4f7f\u7528\u534a\u6210\u54c1\u89c4\u683c", ""),
             "market_unit_impact": to_num(payload.get("market_unit_impact")),
-            "market_total_impact": to_num(payload.get("\u884c\u60c5\u5f71\u54cd")) or 0.0,
+            "market_total_impact": to_num(payload.get("\u884c\u60c5\u5f71\u54cd")),
         }
         for mat, payload in market_ctx.items()
     }
@@ -1873,6 +2046,12 @@ def _calc_market_gap(kind: str, price_impact, market_map: dict, mat, month_qty, 
     price_gap = to_num(price_impact) or 0.0
     if str(kind).strip() == "其他":
         return price_gap
+    if str(kind).strip() == "特殊":
+        market_payload = (market_map or {}).get(mat) or {}
+        total_impact = to_num(market_payload.get("market_total_impact"))
+        if total_impact is not None:
+            return total_impact
+        return _resolve_market_impact_value(market_payload, month_qty, q_qty)
     if q_qty > 0 and not _is_zero_market_suppressed_impact_row(impact_row):
         return _resolve_market_impact_value((market_map or {}).get(mat), month_qty, q_qty)
     return 0.0
@@ -2096,7 +2275,10 @@ def _rename_period_label_value(df, quarter_label, baseline_label=None):
 
 def present_s1(df, month_label, quarter_label, baseline_label=None):
     out = _rename_q_avg_qty_column(df, quarter_label, baseline_label)
-    if out.empty or "工厂" not in out.columns:
+    if out.empty:
+        return out
+    label_col = "工厂" if "工厂" in out.columns else "产品族" if "产品族" in out.columns else None
+    if label_col is None:
         return out
     out = out.copy().astype(object)
     market_col = "行情差异" if "行情差异" in out.columns else "行情影响"
@@ -2112,7 +2294,7 @@ def present_s1(df, month_label, quarter_label, baseline_label=None):
         f"{month_label}月产量",
         q_qty_col,
     ]
-    impact_mask = out["工厂"].astype(str) == "影响"
+    impact_mask = out[label_col].astype(str) == "影响"
     for c in val_cols:
         if c not in out.columns:
             continue
@@ -2190,6 +2372,7 @@ def style_summary_sheet(ws, header_row=1, start_col=1, data_rows=None, data_cols
                     cell.number_format = impact_pct_fmt
                 else:
                     cell.number_format = pct_fmt if c in pct_cols else num_fmt
+    _apply_borders(ws, min_row=header_row, max_row=header_row + data_rows, min_col=start_col, max_col=start_col + data_cols - 1)
 
 
 def style_audit_sheet(ws, header_row=1, start_col=1, data_rows=None, data_cols=None):
@@ -2210,6 +2393,7 @@ def style_audit_sheet(ws, header_row=1, start_col=1, data_rows=None, data_cols=N
             cell.alignment = center
             if r > header_row and isinstance(cell.value, (int, float)):
                 cell.number_format = num_fmt
+    _apply_borders(ws, min_row=header_row, max_row=header_row + data_rows, min_col=start_col, max_col=start_col + data_cols - 1)
 
 
 def style_ratio_sheet(ws):
@@ -2351,39 +2535,61 @@ def write_audit_summary_sheet(writer, sheet_name, audit_df, summary_df):
     )
 
 
-def build_overview_sheet_df(kind_summaries):
-    metrics = [
-        "扣除行情后采购绩效",
-        "修形利用率影响",
-        "损耗率影响",
-        "修形人工成本影响",
+def _pick_summary_total(df: pd.DataFrame):
+    if df is None or df.empty or "工厂" not in df.columns:
+        return {}
+    total_rows = df[df["工厂"].astype(str) == "合计"]
+    return total_rows.iloc[0].to_dict() if not total_rows.empty else {}
+
+
+def build_overview_sheet_df(kind_summaries, factory_material_profile=None):
+    columns = ["项目", "明细", "扣除行情后采购绩效", "修形利用率", "损耗率", "修形人工成本", "行情影响", "合计"]
+    metric_map = [
+        ("扣除行情后采购绩效", "扣除行情后采购绩效"),
+        ("修形利用率", "修形利用率影响"),
+        ("损耗率", "损耗率影响"),
+        ("修形人工成本", "修形人工成本影响"),
     ]
     rows = []
     for label, df in kind_summaries:
-        total = {}
-        if not df.empty and "工厂" in df.columns:
-            total_rows = df[df["工厂"].astype(str) == "合计"]
-            if not total_rows.empty:
-                total = total_rows.iloc[0].to_dict()
-        row = {"项目": label}
-        for metric in metrics:
-            row[metric] = _safe_float(total.get(metric))
-        row["预留"] = 0.0
-        row["综合影响"] = sum(_safe_float(row.get(metric)) for metric in metrics)
+        total = _pick_summary_total(df)
+        row = {"项目": "修形半成品绩效", "明细": label}
+        for out_col, source_col in metric_map:
+            row[out_col] = _safe_float(total.get(source_col))
+        row["行情影响"] = _safe_float(total.get("行情差异", total.get("行情影响")))
+        row["合计"] = sum(_safe_float(row.get(col)) for col in columns[2:6])
         rows.append(row)
-    if rows:
-        total_row = {"项目": "合计"}
-        for col in metrics + ["预留", "综合影响"]:
-            total_row[col] = sum(_safe_float(row.get(col)) for row in rows)
-        rows.append(total_row)
-    columns = ["项目", *metrics, "预留", "综合影响"]
+
+    factory_material_profile = factory_material_profile or {}
+    yield_rows = [
+        ("原料", 0.0, factory_material_profile.get("raw_quantity_impact")),
+        (
+            "棕榈油",
+            factory_material_profile.get("palm_purchase_performance"),
+            factory_material_profile.get("palm_quantity_impact"),
+        ),
+        (
+            "辅料（不含棕榈）",
+            factory_material_profile.get("non_palm_purchase_performance"),
+            factory_material_profile.get("non_palm_quantity_impact"),
+        ),
+    ]
+    for detail, purchase_performance, quantity_impact in yield_rows:
+        row = {"项目": "成品产成率绩效", "明细": detail}
+        for col in columns[2:]:
+            row[col] = 0.0
+        row["扣除行情后采购绩效"] = _safe_float(purchase_performance)
+        row["修形利用率"] = _safe_float(quantity_impact)
+        row["合计"] = row["扣除行情后采购绩效"] + row["修形利用率"]
+        rows.append(row)
+
     return pd.DataFrame(rows, columns=columns)
 
 
 def _is_display_export_sheet(title: str) -> bool:
     title = str(title or "")
     return (
-        title in {"腿肉", "胸肉", "其他"}
+        title in {"腿肉", "胸肉", "其他", "特殊"}
         or title.startswith("腿肉占比-")
         or title.startswith("胸肉占比-")
         or title.startswith("其他占比-")
@@ -2424,7 +2630,7 @@ def _apply_export_column_widths(ws, header_row: int = 1):
 
         if title == "Sheet1":
             width = max(width or 0, 12 if col_idx == 1 else 14)
-        elif title in {"腿肉", "胸肉", "其他"}:
+        elif title in {"腿肉", "胸肉", "其他", "特殊"}:
             base = 10 if col_idx == 1 else 12
             width = max(width or 0, base)
         elif title.startswith(("腿肉占比-", "胸肉占比-", "其他占比-")):
@@ -2539,6 +2745,7 @@ def _style_export_sheet(ws, header_row: int = 1, freeze_cell=None, pct_cols=None
 
     _autosize_columns(ws, start_row=header_row, end_row=min(ws.max_row, 500), min_width=8, max_width=38)
     _apply_export_column_widths(ws, header_row=header_row)
+    _apply_borders(ws, min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column)
 
 
 def write_export_sheet(writer, sheet_name: str, df: pd.DataFrame, title: str | None = None, pct_cols=None):
@@ -2550,6 +2757,142 @@ def write_export_sheet(writer, sheet_name: str, df: pd.DataFrame, title: str | N
     header_row = startrow + 1
     freeze_cell = f"A{header_row + 1}" if ws.max_row > header_row else None
     _style_export_sheet(ws, header_row=header_row, freeze_cell=freeze_cell, pct_cols=pct_cols)
+
+
+def _reset_sheet(ws):
+    for merged_range in list(ws.merged_cells.ranges):
+        ws.unmerge_cells(str(merged_range))
+    _clear_range(ws, 1, max(ws.max_row, 200), 1, max(ws.max_column, 20))
+
+
+def _style_overview_sheet(ws):
+    yellow = PatternFill(fill_type="solid", fgColor="FFFF00")
+    blue = PatternFill(fill_type="solid", fgColor=Color(theme=4, tint=0.7999816888943144))
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    title_font = Font(bold=True, size=12)
+    total_font = Font(bold=True, size=12)
+    num_fmt = r'#,##0_);[Red]\(#,##0\)'
+
+    ws.merge_cells("A1:F1")
+
+    row_heights = {
+        1: 21.0,
+        2: 41.4,
+        3: 20.25,
+        4: 20.25,
+        5: 20.25,
+        6: 20.25,
+        7: 37.35,
+        8: 20.55,
+        9: 20.55,
+        10: 20.55,
+        11: 20.55,
+        12: 24.9,
+    }
+    for row_idx in range(1, 13):
+        ws.row_dimensions[row_idx].height = row_heights[row_idx]
+        for col_idx in range(1, 10):
+            cell = ws.cell(row_idx, col_idx)
+            if isinstance(cell, MergedCell):
+                continue
+            cell.alignment = center
+            if col_idx <= 6 and row_idx >= 2:
+                cell.border = _thin_border
+            if row_idx == 1 and col_idx <= 6:
+                cell.fill = blue
+            if row_idx == 1:
+                cell.font = title_font
+            if col_idx <= 6 and (row_idx in (2, 6, 7, 11) or col_idx == 6):
+                cell.fill = blue
+            if row_idx in (6, 11):
+                cell.font = total_font
+            if row_idx == 12 and col_idx <= 6:
+                cell.fill = yellow
+                cell.font = total_font
+            if col_idx == 1 and row_idx in (2, 7, 12):
+                cell.font = Font(bold=row_idx == 12, size=12 if row_idx == 12 else 11, color="FFFF0000")
+            if row_idx >= 3 and col_idx >= 2 and isinstance(cell.value, (int, float)):
+                cell.number_format = num_fmt
+
+    widths = {
+        "A": 19,
+        "B": 10.44140625,
+        "C": 13,
+        "D": 13,
+        "E": 13,
+        "F": 13,
+        "G": 13,
+        "H": 13,
+        "I": 13,
+    }
+    for col, width in widths.items():
+        ws.column_dimensions[col].width = width
+    ws.freeze_panes = None
+
+
+def _overview_baseline_label(baseline_label: str, quarter_label: str | None = None) -> str:
+    text = str(baseline_label or "").strip()
+    quarter = str(quarter_label or "").strip()
+    match = re.search(r"Q\s*([1-4])", text, flags=re.IGNORECASE) or re.search(r"Q\s*([1-4])", quarter, flags=re.IGNORECASE)
+    if match:
+        return f"25年Q{match.group(1)}"
+    return text
+
+
+def _fill_overview_sheet(
+    ws,
+    overview_df: pd.DataFrame,
+    month_label: str,
+    baseline_label: str,
+    quarter_label: str | None = None,
+):
+    _reset_sheet(ws)
+    display_baseline = _overview_baseline_label(baseline_label, quarter_label)
+    ws["A1"] = f"系统成本的综合影响（{month_label}月VS{display_baseline}）"
+    ws["I1"] = "正数是增加，负数是节约"
+
+    half_rows = overview_df[overview_df["项目"] == "修形半成品绩效"].reset_index(drop=True)
+    finished_rows = overview_df[overview_df["项目"] == "成品产成率绩效"].reset_index(drop=True)
+    if len(half_rows) != 3 or len(finished_rows) != 3:
+        raise ValueError("Sheet1数据结构异常：应包含3类半成品和3类成品产成率数据。")
+
+    for col_idx, header in enumerate(["半成品修形绩效", "扣除行情后采购绩效", "修形利用率", "损耗率", "修形人工成本", "合计"], start=1):
+        ws.cell(2, col_idx).value = header
+    for row_idx, (_, row) in enumerate(half_rows.iterrows(), start=3):
+        ws.cell(row_idx, 1).value = row["明细"]
+        for col_idx, col_name in enumerate(["扣除行情后采购绩效", "修形利用率", "损耗率", "修形人工成本", "合计"], start=2):
+            ws.cell(row_idx, col_idx).value = _safe_float(row[col_name])
+    for col_idx in range(2, 7):
+        ws.cell(6, col_idx).value = sum(_safe_float(ws.cell(row_idx, col_idx).value) for row_idx in range(3, 6))
+    ws["A6"] = "合计"
+
+    ws["A7"] = "成品产成率绩效"
+    ws["B7"] = "价差（采购绩效）"
+    ws["C7"] = "量差"
+    ws["F7"] = "合计"
+    for row_idx, (_, row) in enumerate(finished_rows.iterrows(), start=8):
+        ws.cell(row_idx, 1).value = row["明细"]
+        ws.cell(row_idx, 2).value = _safe_float(row["扣除行情后采购绩效"])
+        ws.cell(row_idx, 3).value = _safe_float(row["修形利用率"])
+        ws.cell(row_idx, 6).value = _safe_float(row["合计"])
+    ws["A11"] = "合计"
+    for col_idx in (2, 3, 6):
+        ws.cell(11, col_idx).value = sum(_safe_float(ws.cell(row_idx, col_idx).value) for row_idx in range(8, 11))
+    ws["A12"] = "系统成本综合影响"
+    ws["F12"] = _safe_float(ws["F6"].value) + _safe_float(ws["F11"].value)
+
+    ws["G3"] = _safe_float(half_rows.iloc[0]["行情影响"])
+    ws["G4"] = _safe_float(half_rows.iloc[1]["行情影响"])
+    ws["H4"] = _safe_float(ws["G3"].value) + _safe_float(ws["G4"].value) + _safe_float(ws["B3"].value) + _safe_float(ws["B4"].value)
+
+    _style_overview_sheet(ws)
+
+
+def write_overview_sheet(writer, overview_df: pd.DataFrame, month_label: str, baseline_label: str, quarter_label: str | None = None):
+    if "Sheet1" in writer.book.sheetnames:
+        writer.book.remove(writer.book["Sheet1"])
+    ws = writer.book.create_sheet("Sheet1", 0)
+    _fill_overview_sheet(ws, overview_df, month_label, baseline_label, quarter_label)
 
 
 def export_calculated_workbook(
@@ -2573,25 +2916,48 @@ def export_calculated_workbook(
     bre_audit: pd.DataFrame,
     other_audit: pd.DataFrame,
     material_spec_profile=None,
+    factory_material_profile=None,
+    special_records=None,
+    special_s1: pd.DataFrame | None = None,
+    special_audit: pd.DataFrame | None = None,
 ):
+    special_records = special_records or []
+    if special_audit is None:
+        special_audit = build_audit_detail(special_records, month_label, quarter_label, "特殊")
+        special_audit = special_audit.rename(columns={"行情影响": "行情差异"})
+    if special_s1 is None:
+        special_s1 = build_special_product_family_summary(special_audit, month_label, quarter_label)
     leg_detail, leg_market_col = _build_kind_detail_df(leg_audit, month_label, quarter_label)
     bre_detail, bre_market_col = _build_kind_detail_df(bre_audit, month_label, quarter_label)
     other_detail, other_market_col = _build_kind_detail_df(other_audit, month_label, quarter_label)
+    special_detail, special_market_col = _build_kind_detail_df(special_audit, month_label, quarter_label)
     leg_grouped = _build_grouped_kind_summary(leg_detail, month_label, quarter_label, leg_market_col)
     bre_grouped = _build_grouped_kind_summary(bre_detail, month_label, quarter_label, bre_market_col)
     other_grouped = _build_grouped_kind_summary(other_detail, month_label, quarter_label, other_market_col)
+    special_grouped = _build_grouped_kind_summary(special_detail, month_label, quarter_label, special_market_col)
     leg_detail_export = _prepare_detail_export_df(leg_detail, quarter_label, baseline_label, leg_market_col, "腿肉")
     bre_detail_export = _prepare_detail_export_df(bre_detail, quarter_label, baseline_label, bre_market_col, "胸肉")
     other_detail_export = _prepare_detail_export_df(other_detail, quarter_label, baseline_label, other_market_col, "其他")
+    special_detail_export = _prepare_detail_export_df(
+        special_detail, quarter_label, baseline_label, special_market_col, "特殊"
+    )
     leg_grouped_export = _rename_q_avg_qty_column(leg_grouped, quarter_label, baseline_label)
     bre_grouped_export = _rename_q_avg_qty_column(bre_grouped, quarter_label, baseline_label)
     other_grouped_export = _rename_q_avg_qty_column(other_grouped, quarter_label, baseline_label)
+    special_grouped_export = _rename_q_avg_qty_column(special_grouped, quarter_label, baseline_label)
     leg_audit_export = _rename_q_avg_qty_column(leg_audit, quarter_label, baseline_label)
     bre_audit_export = _rename_q_avg_qty_column(bre_audit, quarter_label, baseline_label)
     other_audit_export = _rename_q_avg_qty_column(other_audit, quarter_label, baseline_label)
-    leg_parts = _build_part_detail_df(leg_records)
+    special_audit_export = _rename_q_avg_qty_column(special_audit, quarter_label, baseline_label)
+    leg_parts = _build_part_detail_df(
+        leg_records,
+        source_key="month_part_rows_raw",
+        kind="腿肉",
+        material_spec_profile=material_spec_profile,
+    )
     bre_parts = _build_part_detail_df(bre_records)
     other_parts = _build_part_detail_df(other_records)
+    special_parts = _build_part_detail_df(special_records)
     leg_month_spec, leg_q_spec = _build_spec_amounts(
         leg_records,
         _leg_spec_group,
@@ -2635,10 +3001,14 @@ def export_calculated_workbook(
         baseline_label,
     )
     material_specs = _build_material_spec_df(leg_records, bre_records, other_records, material_spec_profile=material_spec_profile)
-    overview_df = build_overview_sheet_df([("腿肉", leg_s1), ("胸肉", bre_s1), ("其他", other_s1)])
+    overview_df = build_overview_sheet_df(
+        [("腿肉", leg_s1), ("胸肉", bre_s1), ("其他原料", other_s1)],
+        factory_material_profile=factory_material_profile,
+    )
     leg_summary_export = _rename_q_avg_qty_column(leg_s1, quarter_label, baseline_label)
     bre_summary_export = _rename_q_avg_qty_column(bre_s1, quarter_label, baseline_label)
     other_summary_export = _rename_q_avg_qty_column(other_s1, quarter_label, baseline_label)
+    special_summary_export = _rename_q_avg_qty_column(special_s1, quarter_label, baseline_label)
     leg_ratio_pct_cols = ["冻品", "鲜品", "合计"]
     bre_ratio_pct_cols = ["冻品", "鲜品", "合计"]
     other_ratio_pct_cols = ["冻品", "鲜品", "合计"]
@@ -2653,16 +3023,19 @@ def export_calculated_workbook(
     other_plant_df = _rename_period_label_value(other_s3, quarter_label, baseline_label)
 
     with pd.ExcelWriter(output_stream, engine="openpyxl") as writer:
-        write_export_sheet(writer, "Sheet1", overview_df, title=f"系统成本的综合影响（{month_label}月VS{baseline_label}）")
+        write_overview_sheet(writer, overview_df, month_label, baseline_label, quarter_label)
         write_export_sheet(writer, "腿肉", leg_summary_export, title=f"腿肉综合影响（{month_label}月 vs {baseline_label}）")
         write_export_sheet(writer, "胸肉", bre_summary_export, title=f"胸肉综合影响（{month_label}月 vs {baseline_label}）")
         write_export_sheet(writer, "其他", other_summary_export, title=f"其他综合影响（{month_label}月 vs {baseline_label}）")
+        write_export_sheet(writer, "特殊", special_summary_export, title=f"特殊综合影响（{month_label}月 vs {baseline_label}）")
         write_export_sheet(writer, "腿肉明细", leg_detail_export, title=f"腿肉明细（{month_label}月 vs {baseline_label}）")
         write_export_sheet(writer, "胸肉明细", bre_detail_export, title=f"胸肉明细（{month_label}月 vs {baseline_label}）")
         write_export_sheet(writer, "其他明细", other_detail_export, title=f"其他明细（{month_label}月 vs {baseline_label}）")
+        write_export_sheet(writer, "特殊明细", special_detail_export, title=f"特殊明细（{month_label}月 vs {baseline_label}）")
         write_export_sheet(writer, "腿肉产品族汇总", leg_grouped_export, title=f"腿肉产品族汇总（{month_label}月 vs {baseline_label}）")
         write_export_sheet(writer, "胸肉产品族汇总", bre_grouped_export, title=f"胸肉产品族汇总（{month_label}月 vs {baseline_label}）")
         write_export_sheet(writer, "其他产品族汇总", other_grouped_export, title=f"其他产品族汇总（{month_label}月 vs {baseline_label}）")
+        write_export_sheet(writer, "特殊产品族汇总", special_grouped_export, title=f"特殊产品族汇总（{month_label}月 vs {baseline_label}）")
         write_export_sheet(writer, f"腿肉占比-{month_label}", leg_ratio_df, title=f"腿肉鲜冻品占比（{month_label}月 vs {baseline_label}）", pct_cols=leg_ratio_pct_cols)
         write_export_sheet(writer, f"胸肉占比-{month_label}", bre_ratio_df, title=f"胸肉鲜冻品占比（{month_label}月 vs {baseline_label}）", pct_cols=bre_ratio_pct_cols)
         write_export_sheet(writer, f"其他占比-{month_label}", other_ratio_df, title=f"其他鲜冻品占比（{month_label}月 vs {baseline_label}）", pct_cols=other_ratio_pct_cols)
@@ -2675,20 +3048,25 @@ def export_calculated_workbook(
         write_export_sheet(writer, "腿肉核对", leg_audit_export, title="腿肉核对明细")
         write_export_sheet(writer, "胸肉核对", bre_audit_export, title="胸肉核对明细")
         write_export_sheet(writer, "其他核对", other_audit_export, title="其他核对明细")
+        write_export_sheet(writer, "特殊核对", special_audit_export, title="特殊核对明细")
         write_export_sheet(writer, "腿肉原料明细", leg_parts, title=f"腿肉原料明细（{month_label}月）")
         write_export_sheet(writer, "胸肉原料明细", bre_parts, title=f"胸肉原料明细（{month_label}月）")
         write_export_sheet(writer, "其他原料明细", other_parts, title=f"其他原料明细（{month_label}月）")
+        write_export_sheet(writer, "特殊原料明细", special_parts, title=f"特殊原料明细（{month_label}月）")
         write_export_sheet(writer, "原料规格", material_specs, title="原料规格映射")
 
         style_summary_sheet(writer.book["腿肉"], header_row=3)
         style_summary_sheet(writer.book["胸肉"], header_row=3)
         style_summary_sheet(writer.book["其他"], header_row=3)
+        style_summary_sheet(writer.book["特殊"], header_row=3)
 
 
         visible_sheet_names = {
+            "Sheet1",
             "腿肉",
             "胸肉",
             "其他",
+            "特殊",
             f"腿肉占比-{month_label}",
             f"胸肉占比-{month_label}",
             f"其他占比-{month_label}",
@@ -2698,8 +3076,8 @@ def export_calculated_workbook(
         }
         for ws in writer.book.worksheets:
             ws.sheet_state = "visible" if ws.title in visible_sheet_names else "hidden"
-        if "腿肉" in writer.book.sheetnames:
-            writer.book.active = writer.book.sheetnames.index("腿肉")
+        if "Sheet1" in writer.book.sheetnames:
+            writer.book.active = writer.book.sheetnames.index("Sheet1")
 
 
 def _input_name(source):
@@ -2870,24 +3248,37 @@ def _build_grouped_kind_summary(detail_df: pd.DataFrame, month_label: str, quart
     return grouped.reset_index(drop=True)
 
 
-def _build_part_detail_df(records):
+def _build_part_detail_df(records, *, source_key="month_part_rows", kind=None, material_spec_profile=None):
     rows = []
+    spec_group_fn = _spec_group_fn_for_kind(kind) if kind else None
     for rec in records:
         plant = rec.get("plant", "")
         code_to_spec = rec.get("code_to_spec") or {}
-        for part in rec.get("month_part_rows") or []:
+        for part in rec.get(source_key) or []:
             raw_code = norm_code(part.get("原料号"))
             qty = _safe_float(part.get("数量"))
             if not raw_code or qty <= 0:
                 continue
+            raw_desc = str(part.get("原料描述") or "").strip()
+            spec_text = str(code_to_spec.get(raw_code, "") or "").strip()
+            if spec_group_fn:
+                resolved_spec = _resolve_spec_bucket(
+                    kind,
+                    raw_code,
+                    spec_text,
+                    raw_desc,
+                    spec_group_fn,
+                    material_spec_profile,
+                )
+                spec_text = resolved_spec or spec_text
             rows.append(
                 {
                     "工厂": plant,
                     "原料号": raw_code,
-                    "原料描述": str(part.get("原料描述") or "").strip(),
+                    "原料描述": raw_desc,
                     "数量": qty,
                     "鲜冻": str(part.get("鲜冻") or "").strip(),
-                    "规格": str(code_to_spec.get(raw_code, "") or "").strip(),
+                    "规格": spec_text,
                 }
             )
     if not rows:
@@ -3013,9 +3404,9 @@ def _load_market_price_profile(source):
 
     c_plant = pick_col("工厂", fallback=0)
     c_kind = pick_col("分类", fallback=1)
-    c_current = pick_col("当前行情价", "当前价格", "当前价", fallback=2)
+    c_scope = pick_col("适用范围", "价格类型")
+    c_current = pick_col("当前行情价", "当前价格", "当前价", fallback=4 if c_scope is not None else 2)
     c_previous = pick_col("基期行情价", "基期价格", "基期价", fallback=3)
-    c_note = pick_col("备注", fallback=4)
 
     rows = []
     lookup = {}
@@ -3026,24 +3417,102 @@ def _load_market_price_profile(source):
         kind = "" if pd.isna(kind_raw) else str(kind_raw).strip()
         if kind not in ("腿肉", "胸肉", "其他") or not plant:
             continue
+        scope_raw = row.get(c_scope) if c_scope is not None else "普通"
+        scope = "特殊" if not pd.isna(scope_raw) and str(scope_raw).strip() == "特殊" else "普通"
         current_pre = to_num(row.get(c_current)) if c_current is not None else None
         previous_pre = to_num(row.get(c_previous)) if c_previous is not None else None
         if current_pre is None and previous_pre is None:
             continue
-        note = "" if c_note is None or pd.isna(row.get(c_note)) else str(row.get(c_note)).strip()
-        payload = {"current_pre": current_pre, "previous_pre": previous_pre, "备注": note}
-        lookup[(plant, kind)] = payload
-        rows.append({"工厂": plant, "分类": kind, "当前行情价": current_pre, "基期行情价": previous_pre, "备注": note})
+        payload = {"current_pre": current_pre, "previous_pre": previous_pre, "适用范围": scope}
+        lookup[(plant, kind, scope)] = payload
+        rows.append(
+            {
+                "工厂": plant,
+                "分类": kind,
+                "适用范围": scope,
+                "基期行情价": previous_pre,
+                "当前行情价": current_pre,
+            }
+        )
 
     clean_df = pd.DataFrame(rows, columns=MARKET_PRICE_TEMPLATE_COLUMNS)
     if not clean_df.empty:
-        clean_df = clean_df.drop_duplicates(subset=["工厂", "分类"], keep="last").reset_index(drop=True)
+        clean_df = clean_df.drop_duplicates(subset=["工厂", "分类", "适用范围"], keep="last").reset_index(drop=True)
     return {"df": clean_df, "lookup": lookup}
 
 
-def _market_price_override_for(plant_code: str, kind: str, market_price_profile=None):
+def _load_factory_material_comparison_profile(source):
+    if source is None:
+        raise ValueError("请上传各厂原料比较表。")
+
+    stream = io.BytesIO(source.getvalue()) if hasattr(source, "getvalue") else source
+    wb = load_workbook(stream, read_only=True, data_only=True)
+
+    exact_sheet_name = next((name for name in wb.sheetnames if str(name).strip() == "汇总"), None)
+    if exact_sheet_name is None:
+        raise ValueError("各厂原料比较表中未找到名称完全等于“汇总”的工作表。")
+
+    ws = wb[exact_sheet_name]
+    required_cells = {
+        "C21": "raw_quantity_impact",
+        "D21": "palm_quantity_impact",
+        "E21": "non_palm_quantity_impact",
+        "I21": "palm_purchase_performance",
+        "J21": "non_palm_purchase_performance",
+    }
+    values = {}
+    invalid_cells = []
+    for coord, key in required_cells.items():
+        value = to_num(ws[coord].value)
+        if value is None:
+            invalid_cells.append(coord)
+        else:
+            values[key] = float(value)
+    if invalid_cells:
+        locations = "、".join(f"汇总!{coord}" for coord in invalid_cells)
+        raise ValueError(f"各厂原料比较表缺少有效数值：{locations}。请上传最新模板的原料比较表。")
+
+    return {"sheet_name": ws.title, **values, "warnings": []}
+
+
+def _market_price_override_for(plant_code: str, kind: str, market_price_profile=None, scope: str = "普通"):
     lookup = (market_price_profile or {}).get("lookup") or {}
-    return lookup.get((normalize_plant_code(plant_code), kind), {})
+    plant = normalize_plant_code(plant_code)
+    scope_key = "特殊" if str(scope or "").strip() == "特殊" else "普通"
+    payload = lookup.get((plant, kind, scope_key))
+    if payload is None and scope_key == "普通":
+        payload = lookup.get((plant, kind))
+    return payload or {}
+
+
+def _special_market_category_by_material(parts, material_spec_profile=None):
+    raw_kind = {}
+    for kind in ("腿肉", "胸肉", "其他"):
+        for raw_code in ((material_spec_profile or {}).get("lookup") or {}).get(kind, {}):
+            raw_kind.setdefault(norm_code(raw_code), kind)
+
+    scores = defaultdict(lambda: defaultdict(float))
+    for part in parts or []:
+        mat = norm_code((part or {}).get("修行后原料"))
+        raw_code = norm_code((part or {}).get("原料号"))
+        if not mat:
+            continue
+        kind = raw_kind.get(raw_code)
+        if kind is None:
+            desc = str((part or {}).get("原料描述") or "")
+            if "胸" in desc:
+                kind = "胸肉"
+            elif any(token in desc for token in ("腿", "琵琶")):
+                kind = "腿肉"
+        if kind is None:
+            continue
+        scores[mat][kind] += abs(to_num((part or {}).get("数量")) or 1.0)
+
+    return {
+        mat: max(kind_scores.items(), key=lambda item: item[1])[0]
+        for mat, kind_scores in scores.items()
+        if kind_scores
+    }
 
 
 def _ordered_actual_rows(rows, quarter_label=None):
@@ -3063,13 +3532,19 @@ def _ordered_actual_rows(rows, quarter_label=None):
     return current_row, previous_row
 
 
-def _build_override_market_impact_map(kind: str, month_rows, plant_code: str, market_price_profile=None):
-    override = _market_price_override_for(plant_code, kind, market_price_profile)
-    current_pre_override = to_num(override.get("current_pre"))
-    previous_pre_override = to_num(override.get("previous_pre"))
-    if current_pre_override is None and previous_pre_override is None:
-        return {}
-
+def _build_override_market_impact_map(
+    kind: str,
+    month_rows,
+    plant_code: str,
+    market_price_profile=None,
+    market_scope: str = "普通",
+    market_category_by_material=None,
+):
+    market_category_by_material = {
+        norm_code(mat): str(category or "").strip()
+        for mat, category in (market_category_by_material or {}).items()
+        if norm_code(mat)
+    }
     by_mat = defaultdict(list)
     for row in month_rows or []:
         mat = norm_code((row or {}).get("修行后原料"))
@@ -3078,9 +3553,22 @@ def _build_override_market_impact_map(kind: str, month_rows, plant_code: str, ma
 
     out = {}
     for mat, rows in by_mat.items():
+        market_category = market_category_by_material.get(mat, kind)
+        if market_category not in ("腿肉", "胸肉", "其他"):
+            continue
+        override = _market_price_override_for(
+            plant_code,
+            market_category,
+            market_price_profile,
+            scope=market_scope,
+        )
+        current_pre_override = to_num(override.get("current_pre"))
+        previous_pre_override = to_num(override.get("previous_pre"))
+        if current_pre_override is None and previous_pre_override is None:
+            continue
         current_row, previous_row = _ordered_actual_rows(rows)
-        current_vals = _actual_metric_values(current_row, kind)
-        previous_vals = _actual_metric_values(previous_row, kind)
+        current_vals = _actual_metric_values(current_row, market_category)
+        previous_vals = _actual_metric_values(previous_row, market_category)
         cur_pre = current_pre_override if current_pre_override is not None else to_num(current_vals.get("pre"))
         prev_pre = previous_pre_override if previous_pre_override is not None else to_num(previous_vals.get("pre"))
         cur_util = to_num(current_vals.get("util"))
@@ -3088,8 +3576,8 @@ def _build_override_market_impact_map(kind: str, month_rows, plant_code: str, ma
         qty = to_num(current_vals.get("qty"))
         if cur_pre is None or prev_pre is None or cur_util in (None, 0) or cur_loss is None:
             continue
-        current_raw = _calc_raw_cost(kind, cur_pre, cur_util, cur_loss)
-        baseline_raw = _calc_raw_cost(kind, prev_pre, cur_util, cur_loss)
+        current_raw = _calc_raw_cost(market_category, cur_pre, cur_util, cur_loss)
+        baseline_raw = _calc_raw_cost(market_category, prev_pre, cur_util, cur_loss)
         if current_raw is None or baseline_raw is None:
             continue
         market_unit = current_raw - baseline_raw
@@ -3103,6 +3591,8 @@ def _build_override_market_impact_map(kind: str, month_rows, plant_code: str, ma
             "previous_pre": prev_pre,
             "market_unit_impact": market_unit,
             "market_total_impact": market_total if market_total is not None else 0.0,
+            "market_category": market_category,
+            "market_scope": "特殊" if str(market_scope).strip() == "特殊" else "普通",
         }
     return out
 
@@ -3131,8 +3621,10 @@ def _spec_headers_for_export(kind: str, material_spec_profile=None):
             resolved_headers.append(header)
 
     extras = [header for header in resolved_headers if header not in base_headers]
-    return list(base_headers) + extras
-
+    result = list(base_headers) + extras
+    if kind == "腿肉":
+        result = [h for h in result if h != "80g"]
+    return result
 
 def _build_material_spec_df(leg_records, bre_records, other_records=None, material_spec_profile=None):
     if material_spec_profile:
@@ -3166,19 +3658,26 @@ def _build_material_spec_df(leg_records, bre_records, other_records=None, materi
     return out.sort_values(by=["分类", "物料号"], kind="stable").reset_index(drop=True)
 
 
-def _build_fresh_frozen_amounts(records):
+def _build_fresh_frozen_amounts(records, *, kind=None):
     month_amounts = defaultdict(lambda: {"冻品": 0.0, "鲜品": 0.0})
     q_amounts = defaultdict(lambda: {"冻品": 0.0, "鲜品": 0.0})
     for rec in records:
         plant = rec.get("plant", "")
-        for part in rec.get("month_part_rows") or []:
-            kind = str(part.get("鲜冻") or "").strip()
-            if kind in ("冻品", "鲜品"):
-                month_amounts[plant][kind] += _safe_float(part.get("数量")) / 1000.0
-        for part in rec.get("q_part_rows") or []:
-            kind = str(part.get("鲜冻") or "").strip()
-            if kind in ("冻品", "鲜品"):
-                q_amounts[plant][kind] += _safe_float(part.get("数量")) / 1000.0
+        code_to_spec = rec.get("code_to_spec") or {}
+        month_source = rec.get("month_part_rows_raw") if kind == "腿肉" else None
+        q_source = rec.get("q_part_rows_raw") if kind == "腿肉" else None
+        if month_source is None:
+            month_source = rec.get("month_part_rows") or []
+        if q_source is None:
+            q_source = rec.get("q_part_rows") or []
+        for part in month_source:
+            fresh_frozen = str(part.get("鲜冻") or "").strip()
+            if fresh_frozen in ("冻品", "鲜品"):
+                month_amounts[plant][fresh_frozen] += _safe_float(part.get("数量")) / 1000.0
+        for part in q_source:
+            fresh_frozen = str(part.get("鲜冻") or "").strip()
+            if fresh_frozen in ("冻品", "鲜品"):
+                q_amounts[plant][fresh_frozen] += _safe_float(part.get("数量")) / 1000.0
 
     def with_total(source):
         total = {"冻品": 0.0, "鲜品": 0.0}
@@ -3189,7 +3688,21 @@ def _build_fresh_frozen_amounts(records):
         out["合计"] = total
         return out
 
-    return with_total(month_amounts), with_total(q_amounts)
+    month_out = with_total(month_amounts)
+    q_out = with_total(q_amounts)
+    return month_out, q_out
+
+
+
+def _is_80g_part(part, code_to_spec, material_spec_profile=None):
+    """Return True if the part raw material spec resolves to 80g."""
+    raw_code = norm_code(part.get("原料号"))
+    raw_desc = str(part.get("原料描述") or "")
+    desc_spec = _leg_spec_group("", raw_desc)
+    if desc_spec:
+        return desc_spec == "80g"
+    spec_text = str(code_to_spec.get(raw_code) or "").strip()
+    return _leg_spec_group(spec_text, raw_desc) == "80g"
 
 
 def _build_spec_amount_export_df(
@@ -3236,7 +3749,7 @@ def _spec_group_fn_for_kind(kind: str):
 
 def _spec_headers_for_kind(kind: str):
     if kind == "腿肉":
-        return ["无规格", "80g", "110G", "120g以上", "120-170g", "170-220", "200-300"]
+        return ["无规格", "110G", "120g以上", "120-170g", "170-220", "200-300"]
     if kind == "胸肉":
         return ["无规格", "120G以上", "200g", "220g以上", "260g", "170-220g", "220-260g", "200-300", "220-300", "260-300g", "300g"]
     return ["无规格"]
@@ -3318,6 +3831,8 @@ def _build_spec_amounts(records, spec_group_fn, *, kind=None, material_spec_prof
         code_to_spec = rec.get("code_to_spec") or {}
         for bucket, source in ((month_amounts, rec.get("month_part_rows") or []), (q_amounts, rec.get("q_part_rows") or [])):
             for part in source:
+                if kind == "腿肉" and _is_80g_part(part, code_to_spec, material_spec_profile):
+                    continue
                 raw_code = norm_code(part.get("原料号"))
                 spec_text = code_to_spec.get(raw_code, "")
                 header = _resolve_spec_bucket(
@@ -3341,7 +3856,10 @@ def _build_spec_amounts(records, spec_group_fn, *, kind=None, material_spec_prof
         out["合计"] = dict(total)
         return out
 
-    return with_total(month_amounts), with_total(q_amounts)
+    month_out = with_total(month_amounts)
+    q_out = with_total(q_amounts)
+    return month_out, q_out
+
 
 
 def _ratio_from_amounts(amount_map, headers):
@@ -3369,34 +3887,25 @@ def _fill_material_spec_sheet(ws, material_df: pd.DataFrame):
         ws[f"D{r}"] = row["规格"]
 
 
-def _fill_sheet1_summary(ws, leg_s1: pd.DataFrame, bre_s1: pd.DataFrame, month_label: str, baseline_label: str):
-    def pick_total(df):
-        if df.empty:
-            return {}
-        total_rows = df[df["工厂"].astype(str) == "合计"]
-        return total_rows.iloc[0].to_dict() if not total_rows.empty else {}
-
-    leg_total = pick_total(leg_s1)
-    bre_total = pick_total(bre_s1)
-    _set_cell(ws, "A2", f"系统成本的综合影响（{month_label}月VS{baseline_label}）")
-
-    for row_idx, total in ((5, leg_total), (6, bre_total)):
-        ws[f"B{row_idx}"] = total.get("扣除行情后采购绩效")
-        ws[f"C{row_idx}"] = total.get("修形利用率影响")
-        ws[f"D{row_idx}"] = total.get("损耗率影响")
-        ws[f"E{row_idx}"] = total.get("修形人工成本影响")
-        ws[f"F{row_idx}"] = 0
-        ws[f"G{row_idx}"] = sum(
-            _safe_float(total.get(col))
-            for col in ("扣除行情后采购绩效", "修形利用率影响", "损耗率影响", "修形人工成本影响")
-        )
-
-    for row_idx in (7, 8):
-        for col in ("B", "C", "D", "E", "F", "G"):
-            ws[f"{col}{row_idx}"] = 0
-
-    for col in ("B", "C", "D", "E", "F", "G"):
-        ws[f"{col}9"] = _safe_float(ws[f"{col}5"].value) + _safe_float(ws[f"{col}6"].value)
+def _fill_sheet1_summary(
+    ws,
+    leg_s1: pd.DataFrame,
+    bre_s1: pd.DataFrame,
+    month_label: str,
+    baseline_label: str,
+    quarter_label: str | None = None,
+    other_s1: pd.DataFrame | None = None,
+    factory_material_profile=None,
+):
+    overview_df = build_overview_sheet_df(
+        [
+            ("腿肉", leg_s1),
+            ("胸肉", bre_s1),
+            ("其他原料", other_s1 if other_s1 is not None else pd.DataFrame()),
+        ],
+        factory_material_profile=factory_material_profile,
+    )
+    _fill_overview_sheet(ws, overview_df, month_label, baseline_label, quarter_label)
 
 
 def _ratio_tuple(values: dict):
@@ -3664,7 +4173,7 @@ def _fill_bre_ratio_sheet(ws, part_df: pd.DataFrame, month_amounts: dict, q_amou
 
 
 def _fill_leg_plant_sheet(ws, month_spec_amounts: dict, q_spec_amounts: dict, month_label: str, baseline_label: str):
-    headers = ["无规格", "80g", "110G", "120g以上", "120-170g", "170-220", "200-300"]
+    headers = ["无规格", "110G", "120g以上", "120-170g", "170-220", "200-300"]
     plant_slots = ["BB1", "BB2", "LY", "DL", "合计"]
     month_ratios = _ratio_from_amounts(month_spec_amounts, headers)
     q_ratios = _ratio_from_amounts(q_spec_amounts, headers)
@@ -3737,6 +4246,7 @@ def export_template_workbook(
     leg_audit: pd.DataFrame,
     bre_audit: pd.DataFrame,
     material_spec_profile=None,
+    factory_material_profile=None,
 ):
     wb = load_workbook(template_path, keep_links=False)
     if hasattr(wb, "_external_links"):
@@ -3746,9 +4256,14 @@ def export_template_workbook(
     leg_grouped = _build_grouped_kind_summary(leg_detail, month_label, quarter_label, leg_market_col)
     bre_grouped = _build_grouped_kind_summary(bre_detail, month_label, quarter_label, bre_market_col)
 
-    leg_parts = _build_part_detail_df(leg_records)
+    leg_parts = _build_part_detail_df(
+        leg_records,
+        source_key="month_part_rows_raw",
+        kind="腿肉",
+        material_spec_profile=material_spec_profile,
+    )
     bre_parts = _build_part_detail_df(bre_records)
-    leg_month_fs, leg_q_fs = _build_fresh_frozen_amounts(leg_records)
+    leg_month_fs, leg_q_fs = _build_fresh_frozen_amounts(leg_records, kind="腿肉")
     bre_month_fs, bre_q_fs = _build_fresh_frozen_amounts(bre_records)
     leg_month_spec, leg_q_spec = _build_spec_amounts(
         leg_records,
@@ -3764,7 +4279,15 @@ def export_template_workbook(
     )
     material_specs = _build_material_spec_df(leg_records, bre_records, material_spec_profile=material_spec_profile)
 
-    _fill_sheet1_summary(_ensure_sheet(wb, "Sheet1", index=0), leg_s1, bre_s1, month_label, baseline_label)
+    _fill_sheet1_summary(
+        _ensure_sheet(wb, "Sheet1", index=0),
+        leg_s1,
+        bre_s1,
+        month_label,
+        baseline_label,
+        quarter_label,
+        factory_material_profile=factory_material_profile,
+    )
     _fill_kind_sheet(wb["腿肉"], leg_detail, leg_grouped, leg_s1, month_label, quarter_label, baseline_label, "腿肉")
     _fill_kind_sheet(wb["胸肉"], bre_detail, bre_grouped, bre_s1, month_label, quarter_label, baseline_label, "胸肉")
     _fill_leg_ratio_sheet(wb["腿肉占比-1"], leg_parts, leg_month_fs, leg_q_fs, month_label, baseline_label)
@@ -3782,10 +4305,12 @@ if SKIP_STREAMLIT_UI:
     q_files = []
     material_spec_file = None
     market_price_file = None
+    factory_material_file = None
 else:
     month_files = st.file_uploader("上传 x月系统成本文件", type=["xlsx"], accept_multiple_files=True)
     q_files = st.file_uploader("上传 Qx系统成本文件", type=["xlsx"], accept_multiple_files=True)
     material_spec_file = st.file_uploader("上传原料规格文件", type=["xlsx"], accept_multiple_files=False)
+    factory_material_file = st.file_uploader("上传各厂原料比较表", type=["xlsx"], accept_multiple_files=False)
     market_price_file = st.file_uploader("上传行情价覆盖文件（可选）", type=["xlsx"], accept_multiple_files=False)
 
 
@@ -3802,6 +4327,8 @@ if month_files and q_files:
     }
     if material_spec_file is not None:
         run_meta["material_spec_file"] = material_spec_file.name
+    if factory_material_file is not None:
+        run_meta["factory_material_file"] = factory_material_file.name
     if market_price_file is not None:
         run_meta["market_price_file"] = market_price_file.name
 
@@ -3824,13 +4351,19 @@ if month_files and q_files:
 
         if material_spec_file is None:
             raise ValueError("请上传原料规格文件，物料规格将严格按该文件计算。")
+        if factory_material_file is None:
+            raise ValueError("请上传各厂原料比较表，Sheet1成品产成率绩效将按该表计算。")
         material_spec_profile = _load_material_spec_profile(material_spec_file)
+        factory_material_profile = _load_factory_material_comparison_profile(factory_material_file)
         market_price_profile = _load_market_price_profile(market_price_file)
+        run_meta["factory_material_sheet"] = factory_material_profile.get("sheet_name")
+        run_meta["factory_material_warnings"] = factory_material_profile.get("warnings", [])
         run_meta["market_price_override_rows"] = len((market_price_profile or {}).get("df", pd.DataFrame()))
 
         leg_records = []
         bre_records = []
         other_records = []
+        special_records = []
         for plant in plants:
             plant_code = normalize_plant_code(plant)
             mf, qf = month_map[plant], q_map[plant]
@@ -3839,16 +4372,20 @@ if month_files and q_files:
             m_leg_tsc = read_tsc_df(mx, "腿肉")
             m_bre_tsc = read_tsc_df(mx, "胸肉")
             m_other_tsc = read_tsc_df(mx, "其他")
+            m_special_tsc = read_tsc_df(mx, "特殊")
             q_leg_tsc = read_tsc_df(qx, "腿肉")
             q_bre_tsc = read_tsc_df(qx, "胸肉")
             q_other_tsc = read_tsc_df(qx, "其他")
+            q_special_tsc = read_tsc_df(qx, "特殊")
 
             m_leg_part = read_part_df(mx, "腿肉")
             m_bre_part = read_part_df(mx, "胸肉")
             m_other_part = read_part_df(mx, "其他")
+            m_special_part = read_part_df(mx, "特殊")
             q_leg_part = read_part_df(qx, "腿肉")
             q_bre_part = read_part_df(qx, "胸肉")
             q_other_part = read_part_df(qx, "其他")
+            q_special_part = read_part_df(qx, "特殊")
 
             if m_leg_tsc is not None or q_leg_tsc is not None:
                 m_rows_raw, m_map_code = parse_tsc(m_leg_tsc) if m_leg_tsc is not None else ([], {})
@@ -3867,10 +4404,10 @@ if month_files and q_files:
                         market_price_profile=market_price_profile,
                     )
                 )
-                leg_month_parts = parse_part(m_leg_part) if m_leg_part is not None else parse_part(q_leg_part)
-                leg_q_parts = parse_part(q_leg_part)
-                leg_month_parts, leg_month_mats = _filter_parts_by_material_spec("腿肉", leg_month_parts, material_spec_profile)
-                leg_q_parts, leg_q_mats = _filter_parts_by_material_spec("腿肉", leg_q_parts, material_spec_profile)
+                leg_month_parts_raw = parse_part(m_leg_part) if m_leg_part is not None else parse_part(q_leg_part)
+                leg_q_parts_raw = parse_part(q_leg_part)
+                leg_month_parts, leg_month_mats = _filter_parts_by_material_spec("腿肉", leg_month_parts_raw, material_spec_profile)
+                leg_q_parts, leg_q_mats = _filter_parts_by_material_spec("腿肉", leg_q_parts_raw, material_spec_profile)
                 leg_records.append(
                     {
                         "plant": plant_code,
@@ -3878,6 +4415,8 @@ if month_files and q_files:
                         "month_tsc_rows": month_rows,
                         "q_tsc_rows": q_rows,
                         "code_to_spec": code_map,
+                        "month_part_rows_raw": leg_month_parts_raw,
+                        "q_part_rows_raw": leg_q_parts_raw,
                         "month_part_rows": leg_month_parts,
                         "q_part_rows": leg_q_parts,
                         "allowed_mats": leg_month_mats | leg_q_mats,
@@ -3964,10 +4503,50 @@ if month_files and q_files:
                     }
                 )
 
+            if m_special_tsc is not None and m_special_part is not None:
+                m_rows_raw, m_map_code = parse_tsc(m_special_tsc)
+                q_rows_raw, q_map_code = parse_tsc(q_special_tsc) if q_special_tsc is not None else ([], {})
+                m_rows = _replace_impact_rows(m_rows_raw, _extract_total_impact_rows(mf, "特殊"))
+                q_rows = _replace_impact_rows(q_rows_raw, _extract_total_impact_rows(qf, "特殊"))
+                code_map = dict(m_map_code)
+                code_map.update(q_map_code)
+                special_month_parts = parse_part(m_special_part)
+                special_q_parts = parse_part(q_special_part) if q_special_part is not None else []
+                special_market_map = dict(_extract_kind_market_impact_map("特殊", mf, qf))
+                special_market_categories = _special_market_category_by_material(
+                    special_month_parts,
+                    material_spec_profile,
+                )
+                special_market_map.update(
+                    _build_override_market_impact_map(
+                        "特殊",
+                        m_rows,
+                        plant_code,
+                        market_price_profile=market_price_profile,
+                        market_scope="特殊",
+                        market_category_by_material=special_market_categories,
+                    )
+                )
+                special_record = {
+                    "plant": plant_code,
+                    "source_month_tsc_rows": m_rows,
+                    "month_tsc_rows": m_rows,
+                    "q_tsc_rows": q_rows,
+                    "code_to_spec": code_map,
+                    "month_part_rows": special_month_parts,
+                    "q_part_rows": special_q_parts,
+                    "allowed_mats": None,
+                    "q_label": quarter_from_name(qf.name),
+                    "market_impact_map": special_market_map,
+                    "fallback_actual_map": _extract_manual_actual_map(mf, "特殊"),
+                    "product_family_map": _extract_product_family_map(mf, "特殊"),
+                }
+                if _is_complete_special_record(special_record, quarter_label):
+                    special_records.append(special_record)
+
         _validate_part_material_coverage(leg_records, quarter_label, "腿肉")
         _validate_part_material_coverage(bre_records, quarter_label, "胸肉")
         _validate_part_material_coverage(other_records, quarter_label, "其他")
-
         leg_s1, leg_s2, leg_s3 = build_kind(
             leg_records,
             month_label,
@@ -3993,13 +4572,18 @@ if month_files and q_files:
         bre_audit = build_audit_detail(bre_records, month_label, quarter_label, "胸肉")
         other_audit = build_audit_detail(other_records, month_label, quarter_label, "其他")
         bre_s1 = bre_s1.rename(columns={"行情影响": "行情差异"})
+        special_audit = build_audit_detail(special_records, month_label, quarter_label, "特殊")
+        special_audit = special_audit.rename(columns={"行情影响": "行情差异"})
+        special_s1 = build_special_product_family_summary(special_audit, month_label, quarter_label)
         run_meta["leg_record_count"] = len(leg_records)
         run_meta["bre_record_count"] = len(bre_records)
         run_meta["other_record_count"] = len(other_records)
+        run_meta["special_record_count"] = len(special_records)
         run_meta["leg_rows"] = {"s1": int(len(leg_s1)), "s2": int(len(leg_s2)), "s3": int(len(leg_s3))}
         run_meta["bre_rows"] = {"s1": int(len(bre_s1)), "s2": int(len(bre_s2)), "s3": int(len(bre_s3))}
         run_meta["other_rows"] = {"s1": int(len(other_s1)), "s2": int(len(other_s2)), "s3": int(len(other_s3))}
         run_meta["audit_rows"] = {"leg": int(len(leg_audit)), "bre": int(len(bre_audit)), "other": int(len(other_audit))}
+        run_meta["special_rows"] = {"s1": int(len(special_s1)), "audit": int(len(special_audit))}
 
         baseline_label = _display_baseline_label(q_files, quarter_label)
         leg_ratio_view = _rename_period_label_value(
@@ -4032,11 +4616,12 @@ if month_files and q_files:
             quarter_label,
             baseline_label,
         )
-        t1, t2, t3, t4, t5, t6, t7, t8, t9 = st.tabs(
+        t1, t2, t3, t4, t5, t6, t7, t8, t9, t10 = st.tabs(
             [
                 f"腿肉-{month_label}月",
                 f"胸肉-{month_label}月",
                 f"其他-{month_label}月",
+                f"特殊-{month_label}月",
                 f"腿肉占比-{month_label}",
                 f"胸肉占比-{month_label}",
                 f"其他占比-{month_label}",
@@ -4052,16 +4637,18 @@ if month_files and q_files:
         with t3:
             st.dataframe(_center_display(present_s1(other_s1, month_label, quarter_label, baseline_label)), width="stretch")
         with t4:
-            st.dataframe(_center_display(leg_ratio_view), width="stretch")
+            st.dataframe(_center_display(present_s1(special_s1, month_label, quarter_label, baseline_label)), width="stretch")
         with t5:
-            st.dataframe(_center_display(bre_ratio_view), width="stretch")
+            st.dataframe(_center_display(leg_ratio_view), width="stretch")
         with t6:
-            st.dataframe(_center_display(other_ratio_view), width="stretch")
+            st.dataframe(_center_display(bre_ratio_view), width="stretch")
         with t7:
-            st.dataframe(_center_display(leg_plant_view), width="stretch")
+            st.dataframe(_center_display(other_ratio_view), width="stretch")
         with t8:
-            st.dataframe(_center_display(bre_plant_view), width="stretch")
+            st.dataframe(_center_display(leg_plant_view), width="stretch")
         with t9:
+            st.dataframe(_center_display(bre_plant_view), width="stretch")
+        with t10:
             st.dataframe(_center_display(other_plant_view), width="stretch")
 
         out = io.BytesIO()
@@ -4086,6 +4673,10 @@ if month_files and q_files:
             bre_audit=bre_audit,
             other_audit=other_audit,
             material_spec_profile=material_spec_profile,
+            factory_material_profile=factory_material_profile,
+            special_records=special_records,
+            special_s1=special_s1,
+            special_audit=special_audit,
         )
         out_name = f"鲜冻品占比-{month_label}.xlsx"
         out_bytes = out.getvalue()
@@ -4117,16 +4708,6 @@ if month_files and q_files:
         st.error(f"处理失败: {e}")
     finally:
         _clear_source_caches()
-
-
-
-
-
-
-
-
-
-
 
 
 
