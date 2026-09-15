@@ -674,7 +674,7 @@ def select_actual_rows(md: dict, qd: dict, quarter_label: str):
 
 def _resolve_effective_q_qty(qrow: dict | None, impact_row: dict | None, kind: str | None = None):
     q_qty = to_num((qrow or {}).get("半成品入库量"))
-    if str(kind or "").strip() == "特殊":
+    if str(kind or "").strip() == "特殊" or _is_group_level_row(impact_row):
         return q_qty or 0.0
     if q_qty in (None, 0):
         q_qty = to_num((impact_row or {}).get("半成品入库量"))
@@ -741,6 +741,33 @@ def _has_total_metrics(row: dict | None):
     return any(to_num(row.get(key)) is not None for key in metric_keys)
 
 
+TOTAL_IMPACT_METRIC_KEYS = (
+    "修形前原料综合耗用单价",
+    "修形利用率",
+    "损耗率",
+    "半成品修形人工成本",
+    "半成品总成本",
+)
+
+
+def _has_complete_total_metrics(row: dict | None):
+    if not row:
+        return False
+    return all(to_num(row.get(key)) is not None for key in TOTAL_IMPACT_METRIC_KEYS)
+
+
+def _is_group_level_row(row: dict | None):
+    return bool((row or {}).get("组级记录"))
+
+
+def _rows_are_group_level(rows_by_type: dict | None):
+    return any(_is_group_level_row(row) for rows in (rows_by_type or {}).values() for row in (rows or []))
+
+
+def _is_supported_material(mat, rows_by_type: dict | None = None):
+    return _looks_like_semifinished_code(mat) or _rows_are_group_level(rows_by_type)
+
+
 def _build_blank_total_impact_row(base_row: dict | None, qty=None):
     base_row = base_row or {}
     return {
@@ -787,37 +814,83 @@ def resolve_material_impact(
     quarter_label: str,
     market_map: dict | None = None,
     fallback_actual_map: dict | None = None,
+    calculation_kind_map: dict | None = None,
 ):
     market_map = market_map or {}
     fallback_actual_map = fallback_actual_map or {}
+    calculation_kind_map = calculation_kind_map or {}
 
-    impact = None
+    month_impact = None
     if "对半成品成本的影响" in md:
         impact_rows = md.get("对半成品成本的影响") or []
-        impact = match_impact_row({"对半成品成本的影响": impact_rows}, prefer_scope="总成本")
-    if impact is None:
-        impact = match_impact_row(md, prefer_scope="总成本")
-    if impact is None and "对半成品成本的影响" in qd:
+        month_impact = match_impact_row({"对半成品成本的影响": impact_rows}, prefer_scope="总成本")
+    if month_impact is None:
+        month_impact = match_impact_row(md, prefer_scope="总成本")
+
+    quarter_impact = None
+    if "对半成品成本的影响" in qd:
         impact_rows = qd.get("对半成品成本的影响") or []
-        impact = match_impact_row({"对半成品成本的影响": impact_rows}, prefer_scope="总成本")
-    if impact is None:
-        impact = match_impact_row(qd, prefer_scope="总成本")
-    if impact is not None and str(impact.get("影响口径", "")).strip() == "总成本":
-        if _has_total_metrics(impact):
-            return impact
-        # Some Q files contain a blank placeholder total-impact row. Do not let it
-        # suppress fallback calculation from actual rows.
-        impact = None
+        quarter_impact = match_impact_row({"对半成品成本的影响": impact_rows}, prefer_scope="总成本")
+    if quarter_impact is None:
+        quarter_impact = match_impact_row(qd, prefer_scope="总成本")
+
+    # A complete monthly TSC total-impact row is authoritative. In particular,
+    # Q-workbook manual labor data must never overwrite labor already supplied by
+    # the monthly TSC row. Special workbooks sometimes expose an all-zero
+    # placeholder, which is treated as missing and rebuilt below.
+    if (
+        month_impact is not None
+        and _has_complete_total_metrics(month_impact)
+        and not (kind == "特殊" and _is_zero_market_suppressed_impact_row(month_impact))
+    ):
+        return month_impact
+
+    impact = month_impact if month_impact is not None else quarter_impact
+    if impact is not None:
+        impact = dict(impact)
+        if kind == "特殊" and _is_zero_market_suppressed_impact_row(impact):
+            for key in TOTAL_IMPACT_METRIC_KEYS:
+                impact[key] = None
 
     mrow, qrow, diff = select_material_rows(md, qd, quarter_label)
     current_actual, previous_actual = select_actual_rows(md, qd, quarter_label)
-    base_row = current_actual or mrow or qrow or diff or previous_actual or {}
+    base_row = current_actual or mrow or impact or qrow or diff or previous_actual or {}
     if not base_row:
         return None
+
+    mat = norm_code(base_row.get("修行后原料") or (impact or {}).get("修行后原料"))
+    calculation_kind = calculation_kind_map.get(mat) or kind
 
     qty = to_num((current_actual or {}).get("半成品入库量"))
     if qty is None:
         qty = to_num((mrow or {}).get("半成品入库量"))
+
+    fallback_actual = (fallback_actual_map.get(mat) or {}) if mat else {}
+    current_vals = _actual_metric_values(current_actual or mrow, calculation_kind)
+    previous_vals = _actual_metric_values(previous_actual, calculation_kind)
+    for key in ("util", "loss", "raw", "lab"):
+        if to_num(previous_vals.get(key)) is None and to_num(fallback_actual.get(key)) is not None:
+            previous_vals[key] = fallback_actual.get(key)
+
+    previous_pre = to_num((previous_actual or {}).get("修形前原料综合耗用单价"))
+    if previous_pre is None:
+        previous_pre = to_num(fallback_actual.get("pre"))
+    if previous_pre is None:
+        previous_pre = to_num((market_map.get(mat) or {}).get("previous_pre"))
+
+    if impact is not None:
+        impact = _fill_missing_total_metrics(
+            impact,
+            calculation_kind,
+            current_vals,
+            previous_vals,
+            previous_pre,
+        )
+        # Keep a monthly/Q total row as the base even when it is only
+        # partially populated.  Missing fields may be rebuilt below, but
+        # values already supplied by TSC must not be discarded or replaced.
+        if _has_complete_total_metrics(impact):
+            return impact
 
     unit_impact = None
     if "对半成品成本的影响" in md:
@@ -829,30 +902,18 @@ def resolve_material_impact(
     if unit_impact is None:
         unit_impact = match_impact_row(qd, prefer_scope="单位成本")
     if unit_impact is not None and qty not in (None, 0):
-        return _scale_unit_impact_row(unit_impact, qty, base_row=base_row)
+        scaled_unit = _scale_unit_impact_row(unit_impact, qty, base_row=base_row)
+        if impact is None:
+            return scaled_unit
+        for key in TOTAL_IMPACT_METRIC_KEYS:
+            if to_num(impact.get(key)) is None and to_num(scaled_unit.get(key)) is not None:
+                impact[key] = scaled_unit[key]
+        if _has_complete_total_metrics(impact):
+            return impact
 
-    if current_actual and previous_actual:
-        fallback_impact = _fallback_total_impact_from_actual_rows(kind, current_actual, previous_actual, qty=qty)
-        if fallback_impact is not None:
-            return fallback_impact
-
-    impact = _build_blank_total_impact_row(base_row, qty=qty)
-    mat = impact.get("修行后原料") or base_row.get("修行后原料")
-    fallback_actual = (fallback_actual_map.get(mat) or {}) if mat else {}
-
-    current_vals = _actual_metric_values(current_actual or mrow, kind)
-    previous_vals = _actual_metric_values(previous_actual, kind)
-    for key in ("util", "loss", "raw", "lab"):
-        if to_num(previous_vals.get(key)) is None and to_num(fallback_actual.get(key)) is not None:
-            previous_vals[key] = fallback_actual.get(key)
-
-    previous_pre = to_num((previous_actual or {}).get("修形前原料综合耗用单价"))
-    if previous_pre is None:
-        previous_pre = to_num(fallback_actual.get("pre"))
-    if previous_pre is None:
-        previous_pre = to_num((market_map.get(mat) or {}).get("previous_pre"))
-
-    impact = _fill_missing_total_metrics(impact, kind, current_vals, previous_vals, previous_pre)
+    if impact is None:
+        impact = _build_blank_total_impact_row(base_row, qty=qty)
+    impact = _fill_missing_total_metrics(impact, calculation_kind, current_vals, previous_vals, previous_pre)
     return impact if _has_total_metrics(impact) or base_row else None
 
 def _validate_part_material_coverage(records, quarter_label, kind):
@@ -876,6 +937,7 @@ def _validate_part_material_coverage(records, quarter_label, kind):
 
         market_map = rec.get("market_impact_map") or {}
         fallback_actual_map = rec.get("fallback_actual_map") or {}
+        calculation_kind_map = rec.get("calculation_kind_map") or {}
         allowed_mats = rec.get("allowed_mats")
         missing_month = []
         missing_q = []
@@ -892,6 +954,7 @@ def _validate_part_material_coverage(records, quarter_label, kind):
                 rec_q_label,
                 market_map=market_map,
                 fallback_actual_map=fallback_actual_map,
+                calculation_kind_map=calculation_kind_map,
             )
             if impact is None or impact.get("影响口径") != "总成本":
                 continue
@@ -900,6 +963,9 @@ def _validate_part_material_coverage(records, quarter_label, kind):
             mrow, qrow, _ = select_material_rows(md, qd, rec_q_label)
             month_qty = to_num((current_actual or mrow or {}).get("半成品入库量")) or 0.0
             q_qty = to_num((previous_actual or qrow or {}).get("半成品入库量")) or 0.0
+
+            if _rows_are_group_level(md) or _rows_are_group_level(qd):
+                continue
 
             missing_month_flag = month_qty > 0 and mat not in month_part_mats
             missing_q_flag = q_qty > 0 and mat not in q_part_mats
@@ -1008,6 +1074,7 @@ def build_kind(records, month_label, quarter_label, kind, material_spec_profile=
             q_grp[r["修行后原料"]][r["行类型"]].append(r)
         market_map = rec.get("market_impact_map") or {}
         fallback_actual_map = rec.get("fallback_actual_map") or {}
+        calculation_kind_map = rec.get("calculation_kind_map") or {}
         allowed_mats = rec.get("allowed_mats")
 
         agg = {
@@ -1026,12 +1093,12 @@ def build_kind(records, month_label, quarter_label, kind, material_spec_profile=
         mats = sorted(set(m_grp.keys()) | set(q_grp.keys()))
         valid_mats = set()
         for mat in mats:
-            if not _looks_like_semifinished_code(mat):
+            md = m_grp.get(mat, {})
+            qd = q_grp.get(mat, {})
+            if not _is_supported_material(mat, md) and not _is_supported_material(mat, qd):
                 continue
             if allowed_mats is not None and mat not in allowed_mats:
                 continue
-            md = m_grp.get(mat, {})
-            qd = q_grp.get(mat, {})
 
             impact = resolve_material_impact(
                 kind,
@@ -1040,6 +1107,7 @@ def build_kind(records, month_label, quarter_label, kind, material_spec_profile=
                 rec_q_label,
                 market_map=market_map,
                 fallback_actual_map=fallback_actual_map,
+                calculation_kind_map=calculation_kind_map,
             )
             if impact is None or impact.get("影响口径") != "总成本":
                 continue
@@ -1278,17 +1346,18 @@ def build_audit_detail(records, month_label, quarter_label, kind):
             q_grp[r["修行后原料"]][r["行类型"]].append(r)
         market_map = rec.get("market_impact_map") or {}
         fallback_actual_map = rec.get("fallback_actual_map") or {}
+        calculation_kind_map = rec.get("calculation_kind_map") or {}
         product_family_map = rec.get("product_family_map") or {}
         allowed_mats = rec.get("allowed_mats")
 
         mats = sorted(set(m_grp.keys()) | set(q_grp.keys()))
         for mat in mats:
-            if not _looks_like_semifinished_code(mat):
+            md = m_grp.get(mat, {})
+            qd = q_grp.get(mat, {})
+            if not _is_supported_material(mat, md) and not _is_supported_material(mat, qd):
                 continue
             if allowed_mats is not None and mat not in allowed_mats:
                 continue
-            md = m_grp.get(mat, {})
-            qd = q_grp.get(mat, {})
 
             impact = resolve_material_impact(
                 kind,
@@ -1297,6 +1366,7 @@ def build_audit_detail(records, month_label, quarter_label, kind):
                 rec_q_label,
                 market_map=market_map,
                 fallback_actual_map=fallback_actual_map,
+                calculation_kind_map=calculation_kind_map,
             )
 
             mrow, qrow, diff = select_material_rows(md, qd, rec_q_label)
@@ -1744,12 +1814,22 @@ def _extract_market_context_map_uncached(source, kind: str):
         current_row, previous_row = _find_actual_rows_before_total(ws, header_row, row_idx, type_col)
         anchor_row = _find_anchor_row(ws_formula, row_idx, mat_col, header_row)
         source_info = _resolve_tsc_source_info(wb_formula, ws_formula, current_row, prod_col, mat_col, spec_col)
-        mat = norm_code(source_info.get("修行后原料")) or (norm_code(ws_formula.cell(anchor_row, mat_col).value) if mat_col else "")
-        if not _looks_like_semifinished_code(mat):
+        resolved_mat = norm_code(source_info.get("修行后原料"))
+        current_mat = norm_code(ws.cell(current_row, mat_col).value) if current_row and mat_col else ""
+        anchor_mat = norm_code(ws_formula.cell(anchor_row, mat_col).value) if mat_col else ""
+        if str(kind).strip() == "其他-全翅" and current_mat:
+            mat = current_mat
+        else:
+            mat = resolved_mat or current_mat or anchor_mat
+        is_full_wing_group = str(kind).strip() == "其他-全翅" and mat == "全翅分割"
+        if not _looks_like_semifinished_code(mat) and not is_full_wing_group:
             continue
 
         product_family = source_info.get("产品族") or (_norm_text(ws_formula.cell(anchor_row, prod_col).value) if prod_col else "")
         spec_name = source_info.get("使用半成品规格") or (_norm_text(ws_formula.cell(anchor_row, spec_col).value) if spec_col else "")
+        if is_full_wing_group:
+            product_family = "全翅分割"
+            spec_name = "全翅分割（组级汇总）"
         current_pre = to_num(ws.cell(current_row, pre_col).value) if current_row and pre_col else None
         current_util = to_num(ws.cell(current_row, util_col).value) if current_row and util_col else None
         current_loss = to_num(ws.cell(current_row, loss_col).value) if current_row and loss_col else None
@@ -1917,12 +1997,22 @@ def _extract_total_impact_rows_uncached(source, kind: str):
         current_row, previous_row = _find_actual_rows_before_total(ws, header_row, row_idx, type_col)
         anchor_row = _find_anchor_row(ws_formula, row_idx, mat_col, header_row)
         source_info = _resolve_tsc_source_info(wb_formula, ws_formula, current_row, prod_col, mat_col, spec_col)
-        mat = norm_code(source_info.get("修行后原料")) or (norm_code(ws_formula.cell(anchor_row, mat_col).value) if mat_col else "")
-        if not _looks_like_semifinished_code(mat):
+        resolved_mat = norm_code(source_info.get("修行后原料"))
+        current_mat = norm_code(ws.cell(current_row, mat_col).value) if current_row and mat_col else ""
+        anchor_mat = norm_code(ws_formula.cell(anchor_row, mat_col).value) if mat_col else ""
+        if str(kind).strip() == "其他-全翅" and current_mat:
+            mat = current_mat
+        else:
+            mat = resolved_mat or current_mat or anchor_mat
+        is_full_wing_group = str(kind).strip() == "其他-全翅" and mat == "全翅分割"
+        if not _looks_like_semifinished_code(mat) and not is_full_wing_group:
             continue
 
         product_family = source_info.get("产品族") or (_norm_text(ws_formula.cell(anchor_row, prod_col).value) if prod_col else "")
         spec_name = source_info.get("使用半成品规格") or (_norm_text(ws_formula.cell(anchor_row, spec_col).value) if spec_col else "")
+        if is_full_wing_group:
+            product_family = "全翅分割"
+            spec_name = "全翅分割（组级汇总）"
         qty_value = to_num(ws.cell(current_row, qty_col).value) if current_row and qty_col else None
         if qty_value is None and anchor_row and qty_col:
             qty_value = to_num(ws.cell(anchor_row, qty_col).value)
@@ -1936,6 +2026,7 @@ def _extract_total_impact_rows_uncached(source, kind: str):
             "综合单价": None,
             "半成品入库量": qty_value,
             "raw_share": {},
+            "组级记录": is_full_wing_group,
         }
         for key, col in metric_cols.items():
             row[key] = to_num(ws.cell(row_idx, col).value) if col else None
@@ -1978,6 +2069,33 @@ def _replace_impact_rows(rows, total_rows):
         if mat:
             by_mat[mat] = row
     return base_rows + list(by_mat.values())
+
+
+def _mark_full_wing_group_rows(rows):
+    marked = []
+    for source_row in rows or []:
+        row = dict(source_row)
+        if norm_code(row.get("修行后原料")) == "全翅分割":
+            row["产品族"] = "全翅分割"
+            row["使用半成品规格"] = "全翅分割（组级汇总）"
+            row["组级记录"] = True
+        marked.append(row)
+    return marked
+
+
+def _extract_full_wing_child_materials(source):
+    """Return output material codes represented by the group-level full-wing TSC."""
+    wb = _load_workbook_cached(source, data_only=True)
+    if "其他-全翅" not in wb.sheetnames:
+        return set()
+
+    children = set()
+    for values in wb["其他-全翅"].iter_rows(values_only=True):
+        for value in values:
+            code = norm_code(value)
+            if _looks_like_semifinished_code(code):
+                children.add(code)
+    return children
 
 
 def _has_total_impact_rows(rows):
@@ -4373,19 +4491,39 @@ if month_files and q_files:
             m_bre_tsc = read_tsc_df(mx, "胸肉")
             m_other_tsc = read_tsc_df(mx, "其他")
             m_special_tsc = read_tsc_df(mx, "特殊")
+            m_full_wing_tsc = (
+                read_sheet_safe(mx, "其他-全翅TSC", score_fn=_score_tsc_columns)
+                if "其他-全翅TSC" in mx.sheet_names
+                else None
+            )
             q_leg_tsc = read_tsc_df(qx, "腿肉")
             q_bre_tsc = read_tsc_df(qx, "胸肉")
             q_other_tsc = read_tsc_df(qx, "其他")
             q_special_tsc = read_tsc_df(qx, "特殊")
+            q_full_wing_tsc = (
+                read_sheet_safe(qx, "其他-全翅TSC", score_fn=_score_tsc_columns)
+                if "其他-全翅TSC" in qx.sheet_names
+                else None
+            )
 
             m_leg_part = read_part_df(mx, "腿肉")
             m_bre_part = read_part_df(mx, "胸肉")
             m_other_part = read_part_df(mx, "其他")
             m_special_part = read_part_df(mx, "特殊")
+            m_full_wing_part = (
+                read_sheet_safe(mx, "其他-全翅", score_fn=_score_part_columns)
+                if "其他-全翅" in mx.sheet_names
+                else None
+            )
             q_leg_part = read_part_df(qx, "腿肉")
             q_bre_part = read_part_df(qx, "胸肉")
             q_other_part = read_part_df(qx, "其他")
             q_special_part = read_part_df(qx, "特殊")
+            q_full_wing_part = (
+                read_sheet_safe(qx, "其他-全翅", score_fn=_score_part_columns)
+                if "其他-全翅" in qx.sheet_names
+                else None
+            )
 
             if m_leg_tsc is not None or q_leg_tsc is not None:
                 m_rows_raw, m_map_code = parse_tsc(m_leg_tsc) if m_leg_tsc is not None else ([], {})
@@ -4465,11 +4603,27 @@ if month_files and q_files:
                     }
                 )
 
-            if m_other_tsc is not None or q_other_tsc is not None:
+            if any(source is not None for source in (m_other_tsc, q_other_tsc, m_full_wing_tsc, q_full_wing_tsc)):
                 m_rows_raw, m_map_code = parse_tsc(m_other_tsc) if m_other_tsc is not None else ([], {})
                 q_rows_raw, q_map_code = parse_tsc(q_other_tsc) if q_other_tsc is not None else ([], {})
                 m_rows = _replace_impact_rows(m_rows_raw, _extract_total_impact_rows(mf, "其他"))
                 q_rows = _replace_impact_rows(q_rows_raw, _extract_total_impact_rows(qf, "其他"))
+                m_full_wing_rows_raw, _ = parse_tsc(m_full_wing_tsc) if m_full_wing_tsc is not None else ([], {})
+                q_full_wing_rows_raw, _ = parse_tsc(q_full_wing_tsc) if q_full_wing_tsc is not None else ([], {})
+                m_full_wing_rows = _mark_full_wing_group_rows(
+                    _replace_impact_rows(
+                        m_full_wing_rows_raw,
+                        _extract_total_impact_rows(mf, "其他-全翅"),
+                    )
+                )
+                q_full_wing_rows = _mark_full_wing_group_rows(
+                    _replace_impact_rows(
+                        q_full_wing_rows_raw,
+                        _extract_total_impact_rows(qf, "其他-全翅"),
+                    )
+                )
+                m_rows.extend(m_full_wing_rows)
+                q_rows.extend(q_full_wing_rows)
                 month_rows = m_rows if m_rows else q_rows
                 code_map = dict(m_map_code)
                 code_map.update(q_map_code)
@@ -4484,8 +4638,30 @@ if month_files and q_files:
                 )
                 other_month_parts = parse_part(m_other_part) if m_other_part is not None else parse_part(q_other_part)
                 other_q_parts = parse_part(q_other_part)
+                full_wing_month_parts = parse_part(m_full_wing_part) if m_full_wing_part is not None else []
+                full_wing_q_parts = parse_part(q_full_wing_part) if q_full_wing_part is not None else []
                 other_month_parts, other_month_mats = _filter_parts_by_material_spec("其他", other_month_parts, material_spec_profile)
                 other_q_parts, other_q_mats = _filter_parts_by_material_spec("其他", other_q_parts, material_spec_profile)
+                full_wing_children = _extract_full_wing_child_materials(mf) | _extract_full_wing_child_materials(qf)
+                other_month_parts = [
+                    part for part in other_month_parts if norm_code(part.get("修行后原料")) not in full_wing_children
+                ]
+                other_q_parts = [
+                    part for part in other_q_parts if norm_code(part.get("修行后原料")) not in full_wing_children
+                ]
+                other_month_mats -= full_wing_children
+                other_q_mats -= full_wing_children
+                other_month_parts.extend(full_wing_month_parts)
+                other_q_parts.extend(full_wing_q_parts)
+                full_wing_group_mats = {
+                    norm_code(row.get("修行后原料"))
+                    for row in m_full_wing_rows + q_full_wing_rows
+                    if _is_group_level_row(row)
+                }
+                other_allowed_mats = other_month_mats | other_q_mats | full_wing_group_mats
+                other_product_family_map = _extract_product_family_map(qf, "其他")
+                for group_mat in full_wing_group_mats:
+                    other_product_family_map[group_mat] = "全翅分割"
                 other_records.append(
                     {
                         "plant": plant_code,
@@ -4495,11 +4671,11 @@ if month_files and q_files:
                         "code_to_spec": code_map,
                         "month_part_rows": other_month_parts,
                         "q_part_rows": other_q_parts,
-                        "allowed_mats": other_month_mats | other_q_mats,
+                        "allowed_mats": other_allowed_mats,
                         "q_label": quarter_from_name(qf.name),
                         "market_impact_map": other_market_map,
                         "fallback_actual_map": _extract_manual_actual_map(qf, "其他"),
-                        "product_family_map": _extract_product_family_map(qf, "其他"),
+                        "product_family_map": other_product_family_map,
                     }
                 )
 
@@ -4540,6 +4716,7 @@ if month_files and q_files:
                     "market_impact_map": special_market_map,
                     "fallback_actual_map": _extract_manual_actual_map(mf, "特殊"),
                     "product_family_map": _extract_product_family_map(mf, "特殊"),
+                    "calculation_kind_map": special_market_categories,
                 }
                 if _is_complete_special_record(special_record, quarter_label):
                     special_records.append(special_record)
