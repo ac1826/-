@@ -815,13 +815,17 @@ def resolve_material_impact(
     market_map: dict | None = None,
     fallback_actual_map: dict | None = None,
     calculation_kind_map: dict | None = None,
+    authoritative_month_impact: dict | None = None,
 ):
     market_map = market_map or {}
     fallback_actual_map = fallback_actual_map or {}
     calculation_kind_map = calculation_kind_map or {}
 
-    month_impact = None
-    if "对半成品成本的影响" in md:
+    # Keep the workbook-extracted monthly total row on a separate path.  This
+    # prevents a parsed/rebuilt impact row from replacing the authoritative TSC
+    # split later in the export pipeline.
+    month_impact = dict(authoritative_month_impact) if authoritative_month_impact else None
+    if month_impact is None and "对半成品成本的影响" in md:
         impact_rows = md.get("对半成品成本的影响") or []
         month_impact = match_impact_row({"对半成品成本的影响": impact_rows}, prefer_scope="总成本")
     if month_impact is None:
@@ -938,6 +942,7 @@ def _validate_part_material_coverage(records, quarter_label, kind):
         market_map = rec.get("market_impact_map") or {}
         fallback_actual_map = rec.get("fallback_actual_map") or {}
         calculation_kind_map = rec.get("calculation_kind_map") or {}
+        month_total_impact_map = rec.get("month_total_impact_map") or {}
         allowed_mats = rec.get("allowed_mats")
         missing_month = []
         missing_q = []
@@ -955,6 +960,7 @@ def _validate_part_material_coverage(records, quarter_label, kind):
                 market_map=market_map,
                 fallback_actual_map=fallback_actual_map,
                 calculation_kind_map=calculation_kind_map,
+                authoritative_month_impact=month_total_impact_map.get(mat),
             )
             if impact is None or impact.get("影响口径") != "总成本":
                 continue
@@ -1075,6 +1081,7 @@ def build_kind(records, month_label, quarter_label, kind, material_spec_profile=
         market_map = rec.get("market_impact_map") or {}
         fallback_actual_map = rec.get("fallback_actual_map") or {}
         calculation_kind_map = rec.get("calculation_kind_map") or {}
+        month_total_impact_map = rec.get("month_total_impact_map") or {}
         allowed_mats = rec.get("allowed_mats")
 
         agg = {
@@ -1108,6 +1115,7 @@ def build_kind(records, month_label, quarter_label, kind, material_spec_profile=
                 market_map=market_map,
                 fallback_actual_map=fallback_actual_map,
                 calculation_kind_map=calculation_kind_map,
+                authoritative_month_impact=month_total_impact_map.get(mat),
             )
             if impact is None or impact.get("影响口径") != "总成本":
                 continue
@@ -1347,6 +1355,7 @@ def build_audit_detail(records, month_label, quarter_label, kind):
         market_map = rec.get("market_impact_map") or {}
         fallback_actual_map = rec.get("fallback_actual_map") or {}
         calculation_kind_map = rec.get("calculation_kind_map") or {}
+        month_total_impact_map = rec.get("month_total_impact_map") or {}
         product_family_map = rec.get("product_family_map") or {}
         allowed_mats = rec.get("allowed_mats")
 
@@ -1367,6 +1376,7 @@ def build_audit_detail(records, month_label, quarter_label, kind):
                 market_map=market_map,
                 fallback_actual_map=fallback_actual_map,
                 calculation_kind_map=calculation_kind_map,
+                authoritative_month_impact=month_total_impact_map.get(mat),
             )
 
             mrow, qrow, diff = select_material_rows(md, qd, rec_q_label)
@@ -2069,6 +2079,14 @@ def _replace_impact_rows(rows, total_rows):
         if mat:
             by_mat[mat] = row
     return base_rows + list(by_mat.values())
+
+
+def _index_total_impact_rows(rows):
+    return {
+        norm_code(row.get("修行后原料")): dict(row)
+        for row in rows or []
+        if norm_code(row.get("修行后原料"))
+    }
 
 
 def _mark_full_wing_group_rows(rows):
@@ -4528,7 +4546,8 @@ if month_files and q_files:
             if m_leg_tsc is not None or q_leg_tsc is not None:
                 m_rows_raw, m_map_code = parse_tsc(m_leg_tsc) if m_leg_tsc is not None else ([], {})
                 q_rows_raw, q_map_code = parse_tsc(q_leg_tsc) if q_leg_tsc is not None else ([], {})
-                m_rows = _replace_impact_rows(m_rows_raw, _extract_total_impact_rows(mf, "腿肉"))
+                m_total_rows = _extract_total_impact_rows(mf, "腿肉")
+                m_rows = _replace_impact_rows(m_rows_raw, m_total_rows)
                 q_rows = _replace_impact_rows(q_rows_raw, _extract_total_impact_rows(qf, "腿肉"))
                 month_rows = m_rows if m_rows else q_rows
                 code_map = dict(m_map_code)
@@ -4562,13 +4581,15 @@ if month_files and q_files:
                         "market_impact_map": leg_market_map,
                         "fallback_actual_map": _extract_manual_actual_map(qf, "腿肉"),
                         "product_family_map": _extract_product_family_map(qf, "腿肉"),
+                        "month_total_impact_map": _index_total_impact_rows(m_total_rows),
                     }
                 )
 
             if m_bre_tsc is not None or q_bre_tsc is not None:
                 m_rows_raw, m_map_code = parse_tsc(m_bre_tsc) if m_bre_tsc is not None else ([], {})
                 q_rows_raw, q_map_code = parse_tsc(q_bre_tsc) if q_bre_tsc is not None else ([], {})
-                m_rows = _replace_impact_rows(m_rows_raw, _extract_total_impact_rows(mf, "胸肉"))
+                m_total_rows = _extract_total_impact_rows(mf, "胸肉")
+                m_rows = _replace_impact_rows(m_rows_raw, m_total_rows)
                 q_rows = _replace_impact_rows(q_rows_raw, _extract_total_impact_rows(qf, "胸肉"))
                 month_rows = m_rows if m_rows else q_rows
                 code_map = dict(m_map_code)
@@ -4600,13 +4621,15 @@ if month_files and q_files:
                         "market_impact_map": bre_market_map,
                         "fallback_actual_map": _extract_manual_actual_map(qf, "胸肉"),
                         "product_family_map": _extract_product_family_map(qf, "胸肉"),
+                        "month_total_impact_map": _index_total_impact_rows(m_total_rows),
                     }
                 )
 
             if any(source is not None for source in (m_other_tsc, q_other_tsc, m_full_wing_tsc, q_full_wing_tsc)):
                 m_rows_raw, m_map_code = parse_tsc(m_other_tsc) if m_other_tsc is not None else ([], {})
                 q_rows_raw, q_map_code = parse_tsc(q_other_tsc) if q_other_tsc is not None else ([], {})
-                m_rows = _replace_impact_rows(m_rows_raw, _extract_total_impact_rows(mf, "其他"))
+                m_total_rows = _extract_total_impact_rows(mf, "其他")
+                m_rows = _replace_impact_rows(m_rows_raw, m_total_rows)
                 q_rows = _replace_impact_rows(q_rows_raw, _extract_total_impact_rows(qf, "其他"))
                 m_full_wing_rows_raw, _ = parse_tsc(m_full_wing_tsc) if m_full_wing_tsc is not None else ([], {})
                 q_full_wing_rows_raw, _ = parse_tsc(q_full_wing_tsc) if q_full_wing_tsc is not None else ([], {})
@@ -4615,6 +4638,9 @@ if month_files and q_files:
                         m_full_wing_rows_raw,
                         _extract_total_impact_rows(mf, "其他-全翅"),
                     )
+                )
+                m_total_rows.extend(
+                    _mark_full_wing_group_rows(_extract_total_impact_rows(mf, "其他-全翅"))
                 )
                 q_full_wing_rows = _mark_full_wing_group_rows(
                     _replace_impact_rows(
@@ -4676,13 +4702,15 @@ if month_files and q_files:
                         "market_impact_map": other_market_map,
                         "fallback_actual_map": _extract_manual_actual_map(qf, "其他"),
                         "product_family_map": other_product_family_map,
+                        "month_total_impact_map": _index_total_impact_rows(m_total_rows),
                     }
                 )
 
             if m_special_tsc is not None and m_special_part is not None:
                 m_rows_raw, m_map_code = parse_tsc(m_special_tsc)
                 q_rows_raw, q_map_code = parse_tsc(q_special_tsc) if q_special_tsc is not None else ([], {})
-                m_rows = _replace_impact_rows(m_rows_raw, _extract_total_impact_rows(mf, "特殊"))
+                m_total_rows = _extract_total_impact_rows(mf, "特殊")
+                m_rows = _replace_impact_rows(m_rows_raw, m_total_rows)
                 q_rows = _replace_impact_rows(q_rows_raw, _extract_total_impact_rows(qf, "特殊"))
                 code_map = dict(m_map_code)
                 code_map.update(q_map_code)
@@ -4717,6 +4745,7 @@ if month_files and q_files:
                     "fallback_actual_map": _extract_manual_actual_map(mf, "特殊"),
                     "product_family_map": _extract_product_family_map(mf, "特殊"),
                     "calculation_kind_map": special_market_categories,
+                    "month_total_impact_map": _index_total_impact_rows(m_total_rows),
                 }
                 if _is_complete_special_record(special_record, quarter_label):
                     special_records.append(special_record)
